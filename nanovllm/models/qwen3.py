@@ -10,6 +10,7 @@ from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
+"""基于layers中的各种组件搭建Qwen3模型"""
 
 class Qwen3Attention(nn.Module):
 
@@ -206,10 +207,10 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return self.model(input_ids, positions) # 计算Qwen3Model的hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self.lm_head(hidden_states)
+        return self.lm_head(hidden_states) # 计算logits
