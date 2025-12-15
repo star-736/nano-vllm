@@ -4,6 +4,11 @@ import torch
 from torch import nn
 from safetensors import safe_open
 
+"""
+加载权重文件及相关工具函数，包括默认权重加载方法和通用模型加载方法。
+支持将safetensors格式的权重文件加载到指定的PyTorch模块参数中，
+并兼容packed_modules_mapping参数名称映射与分片情况。
+"""
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)

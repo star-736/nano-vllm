@@ -17,28 +17,29 @@ class ModelRunner:
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
-        self.block_size = config.kvcache_block_size
+        self.block_size = config.kv_cache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
-        self.rank = rank
+        self.rank = rank # 当前进程的rank
         self.event = event
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
-        default_dtype = torch.get_default_dtype()
+        torch.cuda.set_device(rank) # 设置当前进程的GPU设备
+        default_dtype = torch.get_default_dtype() # 默认数据类型
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
+
+        self.model = Qwen3ForCausalLM(hf_config) # 初始化模型
+        load_model(self.model, config.model) # 加载模型
+        self.sampler = Sampler() # 初始化采样器
+        self.warmup_model() # 预跑一遍模型
+        self.allocate_kv_cache() # 分配kv缓存
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            self.capture_cudagraph() # enforce_eager为true，不会开cuda_graph
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
+        if self.world_size > 1: # 单卡不会跑以下判断
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
@@ -89,6 +90,7 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
+        """预热模型？"""
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
@@ -206,6 +208,9 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        """处理送来的seqs，根据is_prefill来决定是prefill还是decode
+        来自：llm_engine.py token_ids = self.model_runner.call("run", seqs, is_prefill)
+        """
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)

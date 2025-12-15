@@ -30,7 +30,7 @@ nano-vllm/
 │   │   ├── rotary_embedding.py # 旋转位置编码
 │   │   └── embed_head.py       # 嵌入层和输出头
 │   └── utils/                  # 工具函数
-│       ├── context.py          # 上下文管理
+│       ├── context.py          # 全局变量管理
 │       └── loader.py           # 模型加载
 ├── example.py                  # 使用示例
 ├── bench.py                    # 性能基准测试
@@ -56,9 +56,9 @@ outputs = llm.generate(prompts, sampling_params)
 
 `Config` 类管理所有系统参数：
 
-- `max_num_batched_tokens`: 最大批处理 token 数（默认 16384）
+- `max_num_batched_tokens`: 最大批处理 总token 数（默认 16384）
 - `max_num_seqs`: 最大并发序列数（默认 512）
-- `max_model_len`: 最大模型序列长度（默认 4096）
+- `max_model_len`: 最大序列长度（默认 4096）
 - `gpu_memory_utilization`: GPU 内存利用率（默认 0.9）
 - `tensor_parallel_size`: 张量并行大小（默认 1）
 - `enforce_eager`: 是否强制使用 eager 模式（默认 False）
@@ -68,7 +68,7 @@ outputs = llm.generate(prompts, sampling_params)
 
 ### 阶段 1: 初始化（`LLMEngine.__init__`）
 
-1. **配置加载**: 解析用户参数，创建 `Config` 对象
+1. **配置加载**: 解析用户传入参数，创建 `Config` 对象
 2. **模型并行初始化**: 
    - 如果 `tensor_parallel_size > 1`，创建多个进程
    - 每个进程初始化一个 `ModelRunner` 实例
@@ -82,8 +82,8 @@ outputs = llm.generate(prompts, sampling_params)
 2. **序列创建**: 创建 `Sequence` 对象，包含：
    - token IDs 列表
    - 采样参数（温度、最大长度等）
-   - 状态（WAITING/RUNNING/FINISHED）
-   - 块表（block table）用于 KV Cache 管理
+   - 序列状态（WAITING/RUNNING/FINISHED）
+   - kv cache 块表（block table）用于 KV Cache 管理
 
 ### 阶段 3: 调度（`Scheduler.schedule`）
 

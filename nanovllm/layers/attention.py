@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+# 两个不同的kernel，一个不需要拿kv cache，一个需要拿kv cache
 from nanovllm.utils.context import get_context
 
 

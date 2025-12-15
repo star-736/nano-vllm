@@ -16,8 +16,9 @@ def main():
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
-            tokenize=False,
+            tokenize=False, # 在文本层面应用模板
             add_generation_prompt=True,
+            enable_thinking=True,
         )
         for prompt in prompts
     ]
