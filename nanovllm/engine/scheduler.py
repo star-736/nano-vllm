@@ -4,11 +4,11 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
-"""
-调度prefill和decode阶段，管理序列的block块的分配和释放
-"""
 
 class Scheduler:
+    """
+    调度prefill和decode阶段，管理序列的kv cache block块的分配和释放
+    """
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs # 最大并行的序列数
@@ -19,12 +19,15 @@ class Scheduler:
         self.running: deque[Sequence] = deque() # 运行队列里的seq
 
     def is_finished(self):
-        return not self.waiting and not self.running # 等待队列和运行队列都为空，则所有序列都已完成
+        """若等待队列和运行队列都为空，则所有序列都已完成"""
+        return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
-        self.waiting.append(seq) # 将序列添加到等待队列
+        """将序列添加到等待队列"""
+        self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        """调度prefill和decode阶段，管理序列的kv cache block块的分配和释放"""
         scheduled_seqs = [] # 准备做prefill的序列列表
         num_seqs = 0 # 打算做prefill的序列数量
         num_batched_tokens = 0 # 当前batch的累计token数
@@ -66,7 +69,8 @@ class Scheduler:
         return scheduled_seqs, False # 返回decode列表和False
 
     def preempt(self, seq: Sequence):
-        seq.status = SequenceStatus.WAITING # 将输入序列的状态设置为WAITING
+        """将序列从运行队列移到等待队列，并释放对应的blocks"""
+        seq.status = SequenceStatus.WAITING # 输入序列的状态设置为WAITING
         self.block_manager.deallocate(seq) # 释放输入序列的block块
         self.waiting.appendleft(seq) # 将输入序列添加到等待队列
 

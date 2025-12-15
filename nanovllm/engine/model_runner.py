@@ -12,7 +12,12 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
+
+
 class ModelRunner:
+    """
+    nano-vllm的模型运行类，负责模型的前向传播、下一token采样等。
+    """
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
@@ -209,7 +214,8 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        """处理送来的seqs，根据is_prefill来决定是prefill还是decode
+        """
+        处理送来的seqs，根据is_prefill来决定是prefill还是decode
         来自：llm_engine.py token_ids = self.model_runner.call("run", seqs, is_prefill)
         """
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)

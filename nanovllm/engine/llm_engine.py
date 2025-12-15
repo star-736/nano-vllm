@@ -11,6 +11,9 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
+"""
+LLMEngine是nano-vllm的入口类，负责初始化model、tokenizer、scheduler和model_runner等，并提供生成文本的接口。
+"""
 
 class LLMEngine:
 

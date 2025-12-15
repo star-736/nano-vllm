@@ -19,7 +19,7 @@ class Qwen3Attention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        max_position: int = 4096 * 32,
+        max_position: int = 4096 * 32, # 128K
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
@@ -69,33 +69,26 @@ class Qwen3Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        qkv = self.qkv_proj(hidden_states) # qkv: (batch_size, seq_len, 3 * hidden_size)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1) # q, k, v: (batch_size, seq_len, hidden_size)
+
+        # GQA (Group Query Attention)
+        q = q.view(-1, self.num_heads, self.head_dim) # q: (batch_size * seq_len, num_heads, head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim) # k: (batch_size * seq_len, num_kv_heads, head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim) # v: (batch_size * seq_len, num_kv_heads, head_dim)
+        if not self.qkv_bias: # 无qk_bias，做qk_norm
             q = self.q_norm(q)
             k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
+        q, k = self.rotary_emb(positions, q, k) # 相对位置编码
+        o = self.attn(q, k, v) # attn: (batch_size * seq_len, num_heads, head_dim)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
 
 class Qwen3MLP(nn.Module):
 
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-    ) -> None:
+    def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -119,10 +112,7 @@ class Qwen3MLP(nn.Module):
 
 class Qwen3DecoderLayer(nn.Module):
 
-    def __init__(
-        self,
-        config: Qwen3Config,
-    ) -> None:
+    def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
@@ -149,7 +139,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
+        if residual is None: # 第一层residual为None，直接把hidden_states作为residual
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
@@ -160,30 +150,30 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
+    """
+    Qwen3Model = VocabParallelEmbedding + Qwen3DecoderLayer * num_hidden_layers + RMSNorm
+    """
 
-    def __init__(
-        self,
-        config: Qwen3Config,
-    ) -> None:
+    def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        residual = None
+        residual = None # 初始residual为None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual) # 最后的输出不需要residual
         return hidden_states
 
 
 class Qwen3ForCausalLM(nn.Module):
+    """
+    Qwen3ForCausalLM = Qwen3Model + ParallelLMHead
+    """
+
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -192,25 +182,15 @@ class Qwen3ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(
-        self,
-        config: Qwen3Config
-    ) -> None:
+    def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
+        if config.tie_word_embeddings: # False 头尾不共享权重
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return self.model(input_ids, positions) # 计算Qwen3Model的hidden_states
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.lm_head(hidden_states) # 计算logits
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(hidden_states) # 计算logits，在ModelRunner.run_model中调用
