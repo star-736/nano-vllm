@@ -21,6 +21,6 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kv_cache_block_size % 256 == 0 # KV Cache块大小必须是256的倍数
         assert 1 <= self.tensor_parallel_size <= 8 # 张量并行大小必须在1到8之间
-        self.hf_config = AutoConfig.from_pretrained(self.model)
+        self.hf_config = AutoConfig.from_pretrained(self.model) # config.json也会加载，传递给具体的model对象
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings) # 最大序列长度不能超过模型最大位置嵌入长度
         assert self.max_num_batched_tokens >= self.max_model_len # 批处理的总token上限至少能容纳一个最大长度的序列，目前16384>4096

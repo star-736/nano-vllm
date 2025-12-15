@@ -5,6 +5,7 @@ from torch import nn
 from safetensors import safe_open
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
+    """默认的权重加载方法"""
     param.data.copy_(loaded_weight)
 
 

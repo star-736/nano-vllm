@@ -90,12 +90,17 @@ class Qwen3MLP(nn.Module):
 
     def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        # 把gate_proj和up_proj合并成一个线性层进行计算
+        # 根据Qwen3-0.6B的config.json：
+        # intermediate_size = 3072, 
+        # hidden_size = 1024,
+        # hidden_act: "silu"
+        self.gate_up_proj = MergedColumnParallelLinear( # 竖着切/按列切分
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = RowParallelLinear( # 横着切/按行切分
             intermediate_size,
             hidden_size,
             bias=False,
@@ -184,7 +189,7 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
-        self.model = Qwen3Model(config)
+        self.model = Qwen3Model(config) # 默认Qwen3Config但没用到，用的是hf_config
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings: # False 头尾不共享权重
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

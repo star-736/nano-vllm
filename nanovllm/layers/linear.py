@@ -10,14 +10,11 @@ def divide(numerator, denominator):
 
 
 class LinearBase(nn.Module):
+    """
+    线性层基类
+    """
 
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-        tp_dim: int | None = None,
-    ):
+    def __init__(self, input_size: int, output_size: int, bias: bool = False, tp_dim: int | None = None):
         super().__init__()
         self.tp_dim = tp_dim
         self.tp_rank = dist.get_rank()
@@ -31,17 +28,12 @@ class LinearBase(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        raise NotImplementedError # 提醒子类必须重写
 
 
 class ReplicatedLinear(LinearBase):
 
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-    ):
+    def __init__(self, input_size: int, output_size: int, bias: bool = False):
         super().__init__(input_size, output_size, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -52,13 +44,11 @@ class ReplicatedLinear(LinearBase):
 
 
 class ColumnParallelLinear(LinearBase):
+    """
+    列并行线性层
+    """
 
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-    ):
+    def __init__(self, input_size: int, output_size: int, bias: bool = False):
         tp_size = dist.get_world_size()
         super().__init__(input_size, divide(output_size, tp_size), bias, 0)
 
@@ -75,12 +65,7 @@ class ColumnParallelLinear(LinearBase):
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
 
-    def __init__(
-        self,
-        input_size: int,
-        output_sizes: list[int],
-        bias: bool = False,
-    ):
+    def __init__(self, input_size: int, output_sizes: list[int], bias: bool = False):
         self.output_sizes = output_sizes
         super().__init__(input_size, sum(output_sizes), bias)
 
@@ -130,14 +115,9 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 class RowParallelLinear(LinearBase):
 
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-    ):
+    def __init__(self, input_size: int, output_size: int, bias: bool = False):
         tp_size = dist.get_world_size()
-        super().__init__(divide(input_size, tp_size), output_size, bias, 1)
+        super().__init__(divide(input_size, tp_size), output_size, bias, 1) # 传入各GPU的input_size
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data

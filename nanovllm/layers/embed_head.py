@@ -57,7 +57,7 @@ class ParallelLMHead(VocabParallelEmbedding):
     """
 
     def __init__(self, num_embeddings: int, embedding_dim: int, bias: bool = False):
-        assert not bias
+        assert not bias # Qwen3默认没有bias
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
