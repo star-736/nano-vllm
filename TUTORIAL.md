@@ -309,3 +309,4 @@ while not self.is_finished():
 - [Flash Attention Paper](https://arxiv.org/abs/2205.14135)
 - [vLLM Paper](https://arxiv.org/abs/2309.06180)
 - [PagedAttention 博客](https://blog.vllm.ai/)
+- [B站讲解 nano-vllm源码解析](https://www.bilibili.com/video/BV1sY3wzZEDJ/?share_source=copy_web&vd_source=09c164407b7ab0c7599f15be4e93b82a)

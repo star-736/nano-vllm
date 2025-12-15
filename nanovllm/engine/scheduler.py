@@ -4,6 +4,9 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
+"""
+调度prefill和decode阶段，管理序列的block块的分配和释放
+"""
 
 class Scheduler:
 
@@ -22,10 +25,11 @@ class Scheduler:
         self.waiting.append(seq) # 将序列添加到等待队列
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        # prefill
         scheduled_seqs = [] # 准备做prefill的序列列表
         num_seqs = 0 # 打算做prefill的序列数量
         num_batched_tokens = 0 # 当前batch的累计token数
+
+        # prefill
         # 等待队列不为空（还有需要做prefill的）且准备做prefill的序列数小于最大并行序列数
         while self.waiting and num_seqs < self.max_num_seqs:
             # 不断去waiting队列里取出序列加到prefill列表
@@ -44,31 +48,34 @@ class Scheduler:
             return scheduled_seqs, True # 返回prefill列表和True
 
         # decode
+        # 运行队列不为空且准备做decode的序列数小于最大并行序列数
         while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
+            seq = self.running.popleft() # 从运行队列中取出第一个序列
+            while not self.block_manager.can_append(seq): # 如果当前block数不够了
+                if self.running: # 如果运行队列不为空
+                    self.preempt(self.running.pop()) # 从运行队列队尾拿出最后一个序列移到等待队列，并释放对应的blocks
                 else:
-                    self.preempt(seq)
+                    self.preempt(seq) # 如果运行队列为空，则将当前序列移到等待队列，并释放对应的blocks
                     break
             else:
-                num_seqs += 1
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-        assert scheduled_seqs
+                num_seqs += 1 # 准备做decode的序列数加1
+                self.block_manager.may_append(seq) # 如果seq当前block数不够了，则为seq分配一个新的block块
+                scheduled_seqs.append(seq) # 将当前序列添加到decode列表
+        assert scheduled_seqs # scheduled_seqs列表不为空
         self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        return scheduled_seqs, False # 返回decode列表和False
 
     def preempt(self, seq: Sequence):
-        seq.status = SequenceStatus.WAITING
-        self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
+        seq.status = SequenceStatus.WAITING # 将输入序列的状态设置为WAITING
+        self.block_manager.deallocate(seq) # 释放输入序列的block块
+        self.waiting.appendleft(seq) # 将输入序列添加到等待队列
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
+        """更新每个seq的token_ids列表，并更新seq状态"""
         for seq, token_id in zip(seqs, token_ids):
-            seq.append_token(token_id)
+            seq.append_token(token_id) # 将生成的token_id添加到seq的token_ids列表
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                # 如果seq的token_id是结束标识，或者seq的token_ids列表的长度达到了最大token数，则将seq的状态设置为FINISHED
                 seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+                self.block_manager.deallocate(seq) # 释放seq的block块
+                self.running.remove(seq) # 从运行队列中移除seq

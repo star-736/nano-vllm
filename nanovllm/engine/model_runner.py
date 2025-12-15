@@ -135,8 +135,8 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
+            seqlen = len(seq) # 当前序列长度
+            input_ids.extend(seq[seq.num_cached_tokens:]) # 当前序列中已经缓存的token
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
@@ -164,6 +164,7 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        """为decode输出做准备"""
         input_ids = []
         positions = []
         slot_mapping = []
@@ -182,9 +183,9 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = []
+        temperatures = [] # 采样温度列表
         for seq in seqs:
-            temperatures.append(seq.temperature)
+            temperatures.append(seq.temperature) # 添加不同seq的采样温度
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
@@ -212,11 +213,11 @@ class ModelRunner:
         来自：llm_engine.py token_ids = self.model_runner.call("run", seqs, is_prefill)
         """
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        reset_context()
-        return token_ids
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None # 采样温度
+        logits = self.run_model(input_ids, positions, is_prefill) # 模型前向计算，返回logits
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None # 采样token_id，只会用主进程来做
+        reset_context() # 重置全局变量
+        return token_ids # 返回生成的token_ids列表
 
     @torch.inference_mode()
     def capture_cudagraph(self):

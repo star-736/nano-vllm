@@ -51,11 +51,13 @@ class LLMEngine:
         # 对序列进行调度，如果还有没做prefill的序列，则优先返回prefill的序列列表，同时is_prefill=True
         # 如果都做完prefill了，就返回decode的序列列表，同时is_prefill=False
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill) # 将需要处理的seqs送到model_runner的run函数中处理，返回回答的token_ids
-        self.scheduler.postprocess(seqs, token_ids) # 将token_ids添加到seqs的completion_token_ids中
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished] # 获取完成序列的id和token_ids
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs) # 计算总token数
-        return outputs, num_tokens # 返回完成序列的id和token_ids以及总token数
+        # 将需要处理的seqs送到model_runner的run函数中处理，每个seq返回预测的一个token_id，组成token_ids
+        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        self.scheduler.postprocess(seqs, token_ids) # 将生成的token_id添加到seq的token_ids列表中，postprocess每次只处理一个token
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished] # 获取已完成序列的seq_id和回答的token_ids
+         # 计算一次step生成的总token数，正数说明是prefill生成的token，负数说明是decode生成的token，等于len(seqs)说明decode每次只生成一个token
+        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        return outputs, num_tokens # 返回完成序列的id和回答的token_ids以及当前step生成的总token数
 
     def is_finished(self):
         return self.scheduler.is_finished() # 是否所有序列都完成
@@ -79,12 +81,13 @@ class LLMEngine:
         while not self.is_finished(): # 判断当前任务是否都完成（waiting和running队列都为空，则完成）
             t = perf_counter()
             output, num_tokens = self.step() # 执行任务，包括waiting和running里的所有序列
+            # 返回完成序列的id和回答的token_ids以及当前step生成的总token数
 
             # 数据统计部分
             if use_tqdm:
-                if num_tokens > 0:
+                if num_tokens > 0: # 如果为正数，说明是prefill阶段
                     prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
+                else: # 如果为负数，说明是decode阶段
                     decode_throughput = -num_tokens / (perf_counter() - t)
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
