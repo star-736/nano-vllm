@@ -64,6 +64,9 @@ class ColumnParallelLinear(LinearBase):
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
+    """
+    合并列并行线性层
+    """
 
     def __init__(self, input_size: int, output_sizes: list[int], bias: bool = False):
         self.output_sizes = output_sizes

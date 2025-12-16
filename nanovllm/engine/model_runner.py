@@ -12,8 +12,6 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
-
-
 class ModelRunner:
     """
     nano-vllm的模型运行类，负责模型的前向传播、下一token采样等。
@@ -38,7 +36,7 @@ class ModelRunner:
         load_model(self.model, config.model) # 加载模型
         self.sampler = Sampler() # 初始化采样器
         self.warmup_model() # 预跑一遍模型
-        self.allocate_kv_cache() # 分配kv缓存
+        self.allocate_kv_cache() # 分配kv缓存，对应config.py中num_kvcache_blocks: int = -1
         if not self.enforce_eager:
             self.capture_cudagraph() # enforce_eager为true，不会开cuda_graph
         torch.set_default_device("cpu")
@@ -105,13 +103,14 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
+        """分配kv缓存"""
         config = self.config
         hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        free, total = torch.cuda.mem_get_info() # 获取GPU内存信息
+        used = total - free # 已使用的内存
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"] # 内存峰值
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"] # 当前内存使用情况
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size # 每个GPU的kv头数量
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
