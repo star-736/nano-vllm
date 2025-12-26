@@ -26,7 +26,7 @@ class LLMEngine:
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size): # 单卡不会进行以下循环操作，也就是不会开子进程
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process = ctx.Process(target=ModelRunner, args=(config, i, event)) # 创建子进程，每个机器上都跑一个ModelRunner
             process.start()
             self.ps.append(process)
             self.events.append(event)

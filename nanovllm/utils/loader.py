@@ -10,6 +10,7 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 
 def load_model(model: nn.Module, path: str):
+    """加载layers里不同类定义的weight_loader方法"""
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {}) # 获取模型的packed_modules_mapping属性，用于参数名称映射与分片
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
@@ -26,4 +27,4 @@ def load_model(model: nn.Module, path: str):
                 else:
                     param = model.get_parameter(weight_name) # 会去对应类里找nn.Parameter这一行，维度已在初始化各模块时按照tp_size设定好
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, f.get_tensor(weight_name)) # 加载预训练权重
+                    weight_loader(param, f.get_tensor(weight_name)) # 加载对应组件的预训练权重

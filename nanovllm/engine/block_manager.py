@@ -34,7 +34,8 @@ class BlockManager:
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
-        """一个block放满了，才计算hash值，
+        """
+        一个block放满了，才计算hash值，
         hash可以快速比对两个block是否相同
         """
         h = xxhash.xxh64()
@@ -45,7 +46,8 @@ class BlockManager:
         return h.intdigest()
 
     def _allocate_block(self, block_id: int) -> Block:
-        """分配一个新block，
+        """
+        分配一个新block，
         确保 block 未被占用，重置后从空闲 队列转入已用集合并返回
         """
         block = self.blocks[block_id] # 获取block
@@ -56,14 +58,17 @@ class BlockManager:
         return self.blocks[block_id] # 返回block
 
     def _deallocate_block(self, block_id: int) -> Block:
-        """释放一个block，
-        确保引用数为 0，把 block 从已用集合放回空闲队列"""
+        """
+        释放一个block，
+        确保引用数为 0，把 block 从已用集合放回空闲队列
+        """
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
-        """判断空闲block数量是否能覆盖传入序列需要的block数
+        """
+        判断空闲block数量是否能覆盖传入序列需要的block数
         在scheduler里会有判断
         """
         return len(self.free_block_ids) >= seq.num_blocks
@@ -72,7 +77,6 @@ class BlockManager:
         """为seq分配block
         在prefill阶段执行，只会执行一次
         """
-
         assert not seq.block_table # 确保seq的block_table为空，即第一次分配blocks
         hh = -1 # 初始化hash值
         cache_miss = False # 初始化缓存miss标志
@@ -104,7 +108,6 @@ class BlockManager:
 
     def deallocate(self, seq: Sequence):
         """为seq分配block"""
-
         for block_id in reversed(seq.block_table): # 从后往前遍历seq的block_table
             block = self.blocks[block_id] # 取出block
             block.ref_count -= 1 # 减少引用次数
@@ -114,14 +117,18 @@ class BlockManager:
         seq.block_table.clear() # 清空seq的block_table
 
     def can_append(self, seq: Sequence) -> bool:
-        # 剩余的block块的个数 >= （最后一个block的token数 == 1）
-        # 只有取余后发现多出一个token的时候才需要再分配一个整块
-        # 在decode执行之前会去判断
+        """
+        剩余的block块的个数 >= （最后一个block的token数 == 1）
+        只有取余后发现多出一个token的时候才需要再分配一个整块
+        在decode执行之前会去判断
+        """
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
-        """确定can_append了，才会执行may_append
-        may_append是在每次decode之前做的准备"""
+        """
+        确定can_append了，才会执行may_append
+        may_append是在每次decode之前做的准备
+        """
         block_table = seq.block_table # 拿到当前seq的block_table
         last_block = self.blocks[block_table[-1]] # 拿到最后一个block
         if len(seq) % self.block_size == 1: # 如果取余发现多出一个token

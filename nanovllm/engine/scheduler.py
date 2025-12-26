@@ -9,7 +9,6 @@ class Scheduler:
     """
     调度prefill和decode阶段，管理序列的kv cache block块的分配和释放
     """
-
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs # 最大并行的序列数
         self.max_num_batched_tokens = config.max_num_batched_tokens # 最大总token数

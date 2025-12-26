@@ -26,13 +26,13 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim)) # [64]
+        t = torch.arange(max_position_embeddings, dtype=torch.float) # [128K]
+        freqs = torch.einsum("i,j -> ij", t, inv_freq) # 外积 [128K, 64]
         cos = freqs.cos()
         sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1) # [128K, 1, 128]
+        self.register_buffer("cos_sin_cache", cache, persistent=False) # 硬编码，值不会变化
 
     @torch.compile
     def forward(
@@ -56,6 +56,6 @@ def get_rope(
     base: float,
     rope_scaling: dict | None = None,
 ):
-    assert rope_scaling is None
+    assert rope_scaling is None # qwen2的config.json没有rope_scaling这个变量，已赋值None，qwen3有，但为空
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
     return rotary_emb

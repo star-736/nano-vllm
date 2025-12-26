@@ -13,6 +13,7 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
+    """管理任意一条序列的状态"""
     block_size = 256 # kv cache块大小
     counter = count() # 序列id计数器
 

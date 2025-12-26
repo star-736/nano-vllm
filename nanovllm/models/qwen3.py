@@ -13,7 +13,6 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 """基于layers中的各种组件搭建Qwen3模型"""
 
 class Qwen3Attention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -27,7 +26,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = dist.get_world_size() # tp数
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -53,11 +52,11 @@ class Qwen3Attention(nn.Module):
             bias=False,
         )
         self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
+            self.head_dim, # 每个头的维度
+            rotary_dim=self.head_dim, # 每个头的维度
+            max_position=max_position, # 4K * 32
+            base=rope_theta, # 基频
+            rope_scaling=rope_scaling, # 缩放因子, 无
         )
         self.attn = Attention(
             self.num_heads,
@@ -80,14 +79,18 @@ class Qwen3Attention(nn.Module):
         if not self.qkv_bias: # 无qk_bias，做qk_norm
             q = self.q_norm(q)
             k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k) # 相对位置编码
+        q, k = self.rotary_emb(positions, q, k) # 调用的是RotaryEmbedding.forward函数
         o = self.attn(q, k, v) # attn: (batch_size * seq_len, num_heads, head_dim)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
 
 class Qwen3MLP(nn.Module):
-
+    """
+    先列后行
+    gate_up -> Column
+    down -> Row
+    """
     def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str) -> None:
         super().__init__()
         # 把gate_proj和up_proj合并成一个线性层进行计算
@@ -97,7 +100,7 @@ class Qwen3MLP(nn.Module):
         # hidden_act: "silu"
         self.gate_up_proj = MergedColumnParallelLinear( # 竖着切/按列切分
             hidden_size,
-            [intermediate_size] * 2,
+            [intermediate_size] * 2, # 2 = gate + up, [3072, 3072]
             bias=False,
         )
         self.down_proj = RowParallelLinear( # 横着切/按行切分
@@ -116,7 +119,6 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
-
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -158,7 +160,6 @@ class Qwen3Model(nn.Module):
     """
     Qwen3Model = VocabParallelEmbedding + Qwen3DecoderLayer * num_hidden_layers + RMSNorm
     """
-
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
@@ -178,7 +179,6 @@ class Qwen3ForCausalLM(nn.Module):
     """
     Qwen3ForCausalLM = Qwen3Model + ParallelLMHead
     """
-
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),

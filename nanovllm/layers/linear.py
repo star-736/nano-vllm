@@ -13,12 +13,11 @@ class LinearBase(nn.Module):
     """
     线性层基类
     """
-
     def __init__(self, input_size: int, output_size: int, bias: bool = False, tp_dim: int | None = None):
         super().__init__()
-        self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_dim = tp_dim # 指定在哪个维度做切分，0表示列切分，1表示行切分
+        self.tp_rank = dist.get_rank() # 当前进程的rank
+        self.tp_size = dist.get_world_size() # 进程总数 = tp数
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -32,7 +31,9 @@ class LinearBase(nn.Module):
 
 
 class ReplicatedLinear(LinearBase):
-
+    """
+    复制线性层
+    """
     def __init__(self, input_size: int, output_size: int, bias: bool = False):
         super().__init__(input_size, output_size, bias)
 
@@ -47,12 +48,12 @@ class ColumnParallelLinear(LinearBase):
     """
     列并行线性层
     """
-
     def __init__(self, input_size: int, output_size: int, bias: bool = False):
         tp_size = dist.get_world_size()
-        super().__init__(input_size, divide(output_size, tp_size), bias, 0)
+        super().__init__(input_size, divide(output_size, tp_size), bias, 0) # 0表示列切分
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """加载当前GPU对应权重"""
         param_data = param.data
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
@@ -66,15 +67,20 @@ class ColumnParallelLinear(LinearBase):
 class MergedColumnParallelLinear(ColumnParallelLinear):
     """
     合并列并行线性层
+    使用父类forward方法
     """
-
     def __init__(self, input_size: int, output_sizes: list[int], bias: bool = False):
-        self.output_sizes = output_sizes
-        super().__init__(input_size, sum(output_sizes), bias)
+        self.output_sizes = output_sizes # [intermediate_size, intermediate_size]
+        super().__init__(input_size, sum(output_sizes), bias) # sum(output_sizes) = gate_size + up_size
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
+        """
+        loaded_shard_id:
+        "gate_proj": ("gate_up_proj", 0)
+        "up_proj": ("gate_up_proj", 1)
+        """
         param_data = param.data
-        shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
+        shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size 
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
@@ -82,7 +88,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 
 class QKVParallelLinear(ColumnParallelLinear):
-
+    """
+    QKV并行线性层（列并行）
+    使用父类forward方法
+    """
     def __init__(
         self,
         hidden_size: int,
@@ -120,7 +129,7 @@ class RowParallelLinear(LinearBase):
 
     def __init__(self, input_size: int, output_size: int, bias: bool = False):
         tp_size = dist.get_world_size()
-        super().__init__(divide(input_size, tp_size), output_size, bias, 1) # 传入各GPU的input_size
+        super().__init__(divide(input_size, tp_size), output_size, bias, 1) # 1表示行切分
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -132,5 +141,5 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            dist.all_reduce(y)
+            dist.all_reduce(y) # 默认是sum，对所有GPU的计算结果做相加
         return y
