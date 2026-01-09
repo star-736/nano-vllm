@@ -74,7 +74,8 @@ class BlockManager:
         return len(self.free_block_ids) >= seq.num_blocks
 
     def allocate(self, seq: Sequence):
-        """为seq分配block
+        """
+        为seq分配block
         在prefill阶段执行，只会执行一次
         """
         assert not seq.block_table # 确保seq的block_table为空，即第一次分配blocks

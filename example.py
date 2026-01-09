@@ -16,18 +16,18 @@ def main(args):
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
-            tokenize=False, # 在文本层面应用模板
+            tokenize=False, # 在文本层面应用chat_template
             add_generation_prompt=True,
             enable_thinking=True,
         )
         for prompt in prompts
     ]
-    outputs = llm.generate(prompts, sampling_params)
+    outputs = llm.generate(prompts, sampling_params) # outputs是一个列表，每个元素是一个字典，包含text和token_ids
 
     for prompt, output in zip(prompts, outputs):
         print("\n")
         print(f"Prompt: {prompt!r}")
-        print(f"Completion: {output['text']!r}")
+        print(f"Completion: {output['text']!r}") # 只打印text，忽略token_ids
 
 
 if __name__ == "__main__":

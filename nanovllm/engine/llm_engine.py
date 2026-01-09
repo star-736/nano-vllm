@@ -55,12 +55,13 @@ class LLMEngine:
         # 如果都做完prefill了，就返回decode的序列列表，同时is_prefill=False
         seqs, is_prefill = self.scheduler.schedule()
         # 将需要处理的seqs送到model_runner的run函数中处理，每个seq返回预测的一个token_id，组成token_ids
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids) # 将生成的token_id添加到seq的token_ids列表中，postprocess每次只处理一个token
+        token_ids = self.model_runner.call("run", seqs, is_prefill) # [seq_num] 每个seq生成一个新的token的id列表
+        # 将生成的token_id添加到seq的token_ids列表中，并更新seq状态
+        self.scheduler.postprocess(seqs, token_ids) # postprocess每次只处理每个seq的一个token
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished] # 获取已完成序列的seq_id和回答的token_ids
-         # 计算一次step生成的总token数，正数说明是prefill生成的token，负数说明是decode生成的token，等于len(seqs)说明decode每次只生成一个token
+         # 计算一次step生成的总token数，正数说明是prefill生成的token，负数说明是decode生成的token，等于abs(len(seqs))说明是decode阶段，每次只生成一个token
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        return outputs, num_tokens # 返回完成序列的id和回答的token_ids以及当前step生成的总token数
+        return outputs, num_tokens # 返回完成序列的id和回答的token_ids，以及当前step生成的总token数
 
     def is_finished(self):
         return self.scheduler.is_finished() # 是否所有序列都完成
@@ -71,38 +72,42 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
-        # 传入多条prompt 
+        # 传入prompt列表 
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             # 复制多次sampling_params对象
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp) # prompt和sampling_params一一绑定后送到add_request函数中
-        outputs = {}
+            self.add_request(prompt, sp) # prompt和sampling_params一一绑定后送到add_request函数中，添加到等待队列中
+        outputs = {} # 用于存储完成序列的id和回答的token_ids
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished(): # 判断当前任务是否都完成（waiting和running队列都为空，则完成）
-            t = perf_counter()
+            t = perf_counter() # 记录当前时间
             output, num_tokens = self.step() # 执行任务，包括waiting和running里的所有序列
-            # 返回完成序列的id和回答的token_ids以及当前step生成的总token数
+            # 返回完成序列的id和回答的token_ids（该列表可能为空），以及当前step生成的总token数
+            # （num_tokens是正数说明是prefill阶段，负数说明是decode阶段）
 
-            # 数据统计部分
+            # 数据统计部分：prefill和decode的吞吐量
             if use_tqdm:
-                if num_tokens > 0: # 如果为正数，说明是prefill阶段
+                if num_tokens > 0: # 正数，说明是prefill阶段
                     prefill_throughput = num_tokens / (perf_counter() - t)
-                else: # 如果为负数，说明是decode阶段
+                else: # 负数，说明是decode阶段
                     decode_throughput = -num_tokens / (perf_counter() - t)
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
+            # 如果有完成的seq，就更新完成的seq生成的回答的内容
+            # 如果没有，说明当前step没有完成任何seq，继续下一个step，以下逻辑不会被执行
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)
-    
+        
+        # 按seq_id排序，组成一个二维列表，每个元素代表一个已完成seq的回答的token_ids列表
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs] # 字典列表
         if use_tqdm:
             pbar.close()
-        return outputs
+        return outputs # 返回所有完成的seq的回答文本和token_ids

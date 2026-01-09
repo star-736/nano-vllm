@@ -26,17 +26,18 @@ class ModelRunner:
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
-        self.block_size = config.kv_cache_block_size
-        self.enforce_eager = config.enforce_eager 
-        self.world_size = config.tensor_parallel_size # tp数
+        self.block_size = config.kv_cache_block_size # KV Cache块大小(256)
+        self.enforce_eager = config.enforce_eager # 是否强制使用eager模式，不开启cuda_graph
+        self.world_size = config.tensor_parallel_size # TP数
         self.rank = rank # 当前进程的rank
-        self.event = event
+        self.event = event # 事件，用于同步不同进程之间的操作
 
+        # 初始化进程组，使用nccl后端，通信地址为localhost:2333，进程数为world_size
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank) # 设置当前进程的GPU设备
-        default_dtype = torch.get_default_dtype() # 默认数据类型
-        torch.set_default_dtype(hf_config.torch_dtype)
-        torch.set_default_device("cuda")
+        default_dtype = torch.get_default_dtype() # 默认数据类型：torch.float32
+        torch.set_default_dtype(hf_config.torch_dtype) # 设置默认数据类型为模型的torch_dtype：bfloat16，用于加载模型
+        torch.set_default_device("cuda") # 设置默认设备为cuda
 
         # self.model = Qwen3ForCausalLM(hf_config) # 初始化模型
         self.model = model_dict[hf_config.model_type](hf_config) # 初始化模型
@@ -46,11 +47,11 @@ class ModelRunner:
         self.allocate_kv_cache() # 分配kv缓存，对应config.py中num_kvcache_blocks: int = -1
         if not self.enforce_eager: # enforce_eager为true，不会开cuda_graph
             self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+        torch.set_default_device("cpu") # 默认设备设置回cpu，后续会从CPU 列表构建 Tensor 并异步传输到 GPU
+        torch.set_default_dtype(default_dtype) # 默认数据类型设置回torch.float32
 
-        if self.world_size > 1: # 单卡不会跑以下判断
-            # 主进程把shm创建之后，子进程才能连接shm
+        if self.world_size > 1: # 单卡不会跑以下逻辑
+            # 主进程把shm(shared memory)创建之后，子进程才能连接shm
             # 主进程往下执行调度
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20) # 主进程创建共享内存
@@ -61,15 +62,16 @@ class ModelRunner:
                 self.loop() # 子进程进入循环
 
     def exit(self):
+        """退出model_runner / 主进程关闭shm"""
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier()
-            if self.rank == 0:
+            dist.barrier() # 等待所有进程都到达这一步
+            if self.rank == 0: # 主进程负责删除shm
                 self.shm.unlink()
-        if not self.enforce_eager:
+        if not self.enforce_eager: # 如果不是eager模式，删除cuda_graph相关的变量
             del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
-        dist.destroy_process_group()
+        torch.cuda.synchronize() # 等待所有GPU操作完成
+        dist.destroy_process_group() # 销毁进程组，释放资源
 
     def loop(self):
         """子进程循环，读取共享内存中的任务并执行"""
@@ -100,11 +102,11 @@ class ModelRunner:
 
     def call(self, method_name, *args):
         """
-        在llm_engine中调用，
+        在llm_engine.step()中调用，传入方法及参数
         主进程写入共享内存前，子进程处于等待状态，
         等主进程写入方法并调用set()通知子进程后，子进程解析出方法名和参数并清除标志位，
         然后调用对应方法，之后再次进入read_shm()等待下一次任务。
-        主进程也需要调用对应方法
+        主进程也需要调用对应方法：model_runner.run(seqs, is_prefill)
         """
         if self.world_size > 1 and self.rank == 0: # 主进程负责写入共享内存
             self.write_shm(method_name, *args)
@@ -154,10 +156,18 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        """
+        为prefill准备输入数据，用于flash_attn
+            1 input_ids：所有序列 真正需要计算 的 token id 的拼接后的列表
+            2 positions：所有序列 真正需要计算 的 token 在 seq 中的下标的拼接列表
+            3 cu_seqlens_q：FlashAttention 专用的“累积长度”数组（Offset 数组）
+                cu_seqlens_q[i] 表示第 i 个序列在拼接后的 input_ids 中的 起始下标
+            4 cu_seqlens_k：意义同上，针对kv，但包含整个序列的长度（包括已缓存的token）
+        """
         input_ids = []
         positions = []
-        # 给 FlashAttention/变长批处理用，告诉 kernel 每个序列 query/key 的起止
-        cu_seqlens_q = [0] # 每个序列在拼接后的 input_ids 中的起始和结束位置，q的累积长度，只包含需要计算的token
+        # 给 flash-attention/变长批处理用，告诉 kernel 每个序列 query/key 的起止
+        cu_seqlens_q = [0] # 每个序列在拼接后的 input_ids 中的起始和结束位置
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
@@ -166,7 +176,7 @@ class ModelRunner:
         for seq in seqs:
             seqlen = len(seq) # 当前序列长度
             input_ids.extend(seq[seq.num_cached_tokens:]) # 去掉当前序列中已经缓存的token后的token_ids
-            positions.extend(list(range(seq.num_cached_tokens, seqlen))) # extend需要计算的token在seq里的下标
+            positions.extend(list(range(seq.num_cached_tokens, seqlen))) # extend需要计算的token在当前seq里的下标
             seqlen_q = seqlen - seq.num_cached_tokens # 当前序列中需要计算的部分长度
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q) # 加入q的累积长度
@@ -183,27 +193,28 @@ class ModelRunner:
                 else:
                     # 最后一个block可能未填满，用 seq.last_block_num_tokens 精确到实际 token 数
                     end = start + seq.last_block_num_tokens
+                # TODO slot_mapping 是为了什么？
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]: # prefix cache
             block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True) # 从 CPU 列表构建 Tensor 并异步传输到 GPU
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
-        return input_ids, positions
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables) # 设置全局变量，供flash_attn使用
+        return input_ids, positions # 返回input_ids和positions，做前向运算，输出下一token
 
     def prepare_decode(self, seqs: list[Sequence]):
         """为decode输出做准备"""
-        input_ids = []
-        positions = []
+        input_ids = [] # 每个seq最后一个token_id的列表
+        positions = [] # 每个seq最后一个token的位置索引的列表
         slot_mapping = []
-        context_lens = []
+        context_lens = [] # 每个seq长度的列表
         for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
+            input_ids.append(seq.last_token) # 每个seq的最后一个token_id
+            positions.append(len(seq) - 1) # 每个seq的最后一个token的位置索引
+            context_lens.append(len(seq)) # 每个seq的长度
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -214,6 +225,7 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
+        """采样参数（温度）准备"""
         temperatures = [] # 采样温度列表
         for seq in seqs:
             temperatures.append(seq.temperature) # 添加不同seq的采样温度
@@ -222,11 +234,20 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        """计算模型输出下一个token的logits"""
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            # prefill阶段，或者enforce_eager为true，或者seq_num大于512，直接走普通调用
+            # input_ids: [seq_num, _]
+            # positions: [seq_num]
+            # 遇到以下三种情况：1）prefill阶段，
+            # 2）enforce_eager为true（prefill / decode都可），
+            # 3）seq_num大于512，直接走普通调用
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
-            bs = input_ids.size(0)
+            # input_ids: [seq_num]
+            # positions: [seq_num]
+            # decode阶段且enforce_eager为false：
+            #   只传入每个seq的最后一个token_id和位置索引，kv_cache由context.get_context()提供
+            bs = input_ids.size(0) # bs = seq_num
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)] # 对当前seq_num向上取整
             graph_vars = self.graph_vars
@@ -243,8 +264,11 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         """
         处理送来的seqs，根据is_prefill来决定是prefill还是decode
-        来自：llm_engine.py token_ids = self.model_runner.call("run", seqs, is_prefill)
+        来自：llm_engine.py 
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+        计算logits -> 采样token_id -> 重置kv状态 -> 返回seqs的新生成token_id列表
         """
+        # 根据is_prefill标识符为prefill / decode 准备输入数据，返回
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None # 采样温度
         logits = self.run_model(input_ids, positions, is_prefill) # 模型前向计算，返回logits

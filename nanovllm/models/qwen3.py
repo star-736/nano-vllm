@@ -195,6 +195,14 @@ class Qwen3ForCausalLM(nn.Module):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """
+        prefill:
+            input_ids: _
+        decode:
+            input_ids: [seq_num] the last token id of each seq
+        
+        positions: [seq_num] the position of the last token of each seq
+        """
         return self.model(input_ids, positions) # 计算Qwen3Model的hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

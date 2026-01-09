@@ -26,7 +26,7 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids) # prompt的token数
         self.num_cached_tokens = 0 # 缓存的token数
         self.block_table = [] # block表，用于记录kv cache块的id
-        self.temperature = sampling_params.temperature # 温度
+        self.temperature = sampling_params.temperature # 温度，seq之间可不同
         self.max_tokens = sampling_params.max_tokens # 单条样本的最大token数
         self.ignore_eos = sampling_params.ignore_eos # 是否忽略EOS
 
