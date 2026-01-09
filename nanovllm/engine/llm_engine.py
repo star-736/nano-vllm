@@ -22,7 +22,7 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
         self.ps = [] # 进程列表
-        self.events = []
+        self.events = [] # config.tensor_parallel_size - 1 个event，传入主进程
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size): # 单卡不会进行以下循环操作，也就是不会开子进程
             event = ctx.Event()
@@ -30,7 +30,7 @@ class LLMEngine:
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events) # 创建model_runner对象，传入config，rank为0，会在其中加载模型权重
+        self.model_runner = ModelRunner(config, 0, self.events) # 主进程model_runner对象，传入config，rank为0，会在其中加载模型权重
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True) # 创建tokenizer
         config.eos = self.tokenizer.eos_token_id # 设置结束符
         self.scheduler = Scheduler(config) # 初始化调度器

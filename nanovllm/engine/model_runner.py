@@ -27,8 +27,8 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kv_cache_block_size
-        self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
+        self.enforce_eager = config.enforce_eager 
+        self.world_size = config.tensor_parallel_size # tp数
         self.rank = rank # 当前进程的rank
         self.event = event
 
@@ -44,19 +44,21 @@ class ModelRunner:
         self.sampler = Sampler() # 初始化采样器
         self.warmup_model() # 预跑一遍模型
         self.allocate_kv_cache() # 分配kv缓存，对应config.py中num_kvcache_blocks: int = -1
-        if not self.enforce_eager:
-            self.capture_cudagraph() # enforce_eager为true，不会开cuda_graph
+        if not self.enforce_eager: # enforce_eager为true，不会开cuda_graph
+            self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1: # 单卡不会跑以下判断
+            # 主进程把shm创建之后，子进程才能连接shm
+            # 主进程往下执行调度
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20) # 创建共享内存
+                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20) # 主进程创建共享内存
                 dist.barrier() # 等待所有进程都到达这一步
             else:
                 dist.barrier() # 等待所有进程都到达这一步
-                self.shm = SharedMemory(name="nanovllm") # 连接共享内存
-                self.loop()
+                self.shm = SharedMemory(name="nanovllm") # 子进程连接共享内存
+                self.loop() # 子进程进入循环
 
     def exit(self):
         if self.world_size > 1:
@@ -70,36 +72,44 @@ class ModelRunner:
         dist.destroy_process_group()
 
     def loop(self):
+        """子进程循环，读取共享内存中的任务并执行"""
         while True:
-            method_name, args = self.read_shm()
-            self.call(method_name, *args)
-            if method_name == "exit":
+            method_name, args = self.read_shm() # 读取共享内存中的任务，方法名
+            self.call(method_name, *args) # 调用方法
+            if method_name == "exit": # 如果方法名是"exit"，子进程退出循环
                 break
 
     def read_shm(self):
-        """读取共享内存"""
-        assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
-        n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
-        return method_name, args
+        """子进程读取共享内存"""
+        assert self.world_size > 1 and self.rank > 0 # 子进程读取共享内存
+        self.event.wait() # 等待主进程的通知
+        n = int.from_bytes(self.shm.buf[0:4], "little") # 从共享内存前4个字节获取数据长度
+        method_name, *args = pickle.loads(self.shm.buf[4:n+4]) # 解析方法名和参数
+        self.event.clear() # 清除标志位
+        return method_name, args # 返回方法名和参数
 
     def write_shm(self, method_name, *args):
-        """写入共享内存"""
-        assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
-        n = len(data)
-        self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
+        """主进程写入共享内存"""
+        assert self.world_size > 1 and self.rank == 0 # 只有主进程负责写入共享内存
+        data = pickle.dumps([method_name, *args]) # 序列化方法名和参数
+        n = len(data) # 获取序列化数据的长度
+        self.shm.buf[0:4] = n.to_bytes(4, "little") # 将数据长度写入共享内存前4个字节
+        self.shm.buf[4:n+4] = data # 将数据写入共享内存
         for event in self.event:
-            event.set()
+            event.set() # 通知子进程去读共享内存
 
     def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
+        """
+        在llm_engine中调用，
+        主进程写入共享内存前，子进程处于等待状态，
+        等主进程写入方法并调用set()通知子进程后，子进程解析出方法名和参数并清除标志位，
+        然后调用对应方法，之后再次进入read_shm()等待下一次任务。
+        主进程也需要调用对应方法
+        """
+        if self.world_size > 1 and self.rank == 0: # 主进程负责写入共享内存
             self.write_shm(method_name, *args)
-        method = getattr(self, method_name, None)
-        return method(*args)
+        method = getattr(self, method_name, None) # 获取方法
+        return method(*args) # 调用方法
 
     def warmup_model(self):
         """预热模型：用模拟数据让模型完整跑一遍前向流程，触发 CUDA 懒加载初始化"""
@@ -213,11 +223,12 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            # prefill阶段，或者enforce_eager为true，或者seq_num大于512，直接走普通调用
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)] # 对当前seq_num向上取整
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -237,32 +248,38 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None # 采样温度
         logits = self.run_model(input_ids, positions, is_prefill) # 模型前向计算，返回logits
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None # 采样token_id，只会用主进程来做
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None # 采样token_id，只会用主进程来做，子进程回到loop()下一轮
         reset_context() # 重置全局变量
         return token_ids # 返回生成的token_ids列表
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        """针对decode阶段进行优化"""
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = min(self.config.max_num_seqs, 512) # 单次推理最大的seq数
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        # 开辟好cuda graph需要的全部最大空间
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16)) # 预定义不同批量大小
         self.graphs = {}
         self.graph_pool = None
 
-        for bs in reversed(self.graph_bs):
+        for bs in reversed(self.graph_bs): # 倒叙遍历，先开辟最大的
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            set_context(
+                False, # False表示decode阶段
+                slot_mapping=slot_mapping[:bs], 
+                context_lens=context_lens[:bs], 
+                block_tables=block_tables[:bs])
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs]) # warmup
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs]) # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph

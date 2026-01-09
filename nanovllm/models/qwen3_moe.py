@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-from transformers import Qwen3MoeConfig
+from transformers import Qwen3MoeConfig # 对应huggingface中的config
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
@@ -118,20 +118,20 @@ class Qwen3MoeMLP(nn.Module):
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
-
+    """
+    Qwen3稀疏MoE块
+    """
     def __init__(
         self,
         config: Qwen3MoeConfig,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.hidden_act = config.hidden_act
+        self.num_experts = config.num_experts # 专家数 = 128
+        self.top_k = config.num_experts_per_tok # 每个token选择的专家数 = 8
+        self.norm_topk_prob = config.norm_topk_prob # 是否对topk概率再次进行归一化
 
-        self.num_experts = config.num_experts
-        self.top_k = config.num_experts_per_tok
-
-        # gating
+        # 门控，用于之后选择专家
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [
@@ -142,50 +142,54 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 )
                 for _ in range(self.num_experts)
             ]
-        )
+        ) # 定义num_experts个专家，每个专家是一个MLP
 
     def forward(self, hidden_states: torch.Tensor):
-        sequence_length, hidden_dim = hidden_states.shape
-        router_logits = self.gate(hidden_states)
+        seq_len, hidden_dim = hidden_states.shape
+        router_logits = self.gate(hidden_states) # 路由得分 [seq_len, num_experts]
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float) # 路由概率 [seq_len, num_experts]
         routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        # we cast back to the input dtype
-        routing_weights = routing_weights.to(hidden_states.dtype)
+            routing_weights, self.top_k, dim=-1 # 选择前k个专家，[seq_len, top_k]
+        ) # selected_experts表示在num_experts中的索引[0-127]
+        if self.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True) # 再次归一化
+        routing_weights = routing_weights.to(hidden_states.dtype) # cast back to the input dtype
 
         final_hidden_states = torch.zeros(
             hidden_states.shape,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
-        )
+        ) # 预定义最终输出维度 [seq_len, hidden_dim]
 
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
+
+        # 对当前token选定的专家进行额外维度的独热编码，以创建专家掩码
+        # 这将用于索引将要被请求的专家
+        # 第0维表示在num_experts中的第i个专家[0-127]
+        # 第1维表示第0维对应的专家在当前token中是第几顺位[0-7]
+        # 第2维表示第k个token [0-seq_len]
         expert_mask = torch.nn.functional.one_hot(
             selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
+        ).permute(2, 1, 0) # [num_experts, top_k, seq_len]
 
-        expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hitted:
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+        expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero() # 返回当前seq_len所有token中被激活专家的索引
+        for expert_idx in expert_hitted: # 逐个处理被激活的专家
+            expert_layer = self.experts[expert_idx] # 对应MLP
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0)) # 找到需要该专家处理的token位置
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim) # 提取需要当前专家处理的隐藏状态
             current_hidden_states = (
                 expert_layer(current_state) * routing_weights[top_x, idx, None]
-            )
+            ) # 选中的专家计算完乘上归一化系数
 
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
             final_hidden_states.index_add_(
                 0, top_x, current_hidden_states.to(hidden_states.dtype)
             )
-        return final_hidden_states
+        return final_hidden_states # [seq_len, hidden_dim]
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
