@@ -14,7 +14,7 @@ class Context:
     max_seqlen_k: int = 0
     slot_mapping: torch.Tensor | None = None # 见model_runner | prepare_prefill / prepare_decode
     context_lens: torch.Tensor | None = None
-    block_tables: torch.Tensor | None = None
+    block_tables: torch.Tensor | None = None 
 
 _CONTEXT = Context()
 

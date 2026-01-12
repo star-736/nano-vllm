@@ -4,9 +4,15 @@ import numpy as np
 
 from nanovllm.engine.sequence import Sequence
 
+"""
+重点解析：
+    prefix cache：
+        复用不同序列之间的相同前缀的kv cache block，但必须是放满的block
+        在allocate(seq)中去尝试去复用缓存的block，如果找不到，则分配新的block
+"""
 
 class Block:
-    """Block类，用于存储每个block的信息"""
+    """用于存储每个block的信息"""
     def __init__(self, block_id):
         self.block_id = block_id # 当前block的id
         self.ref_count = 0 # 引用的次数
@@ -24,7 +30,7 @@ class Block:
 
 
 class BlockManager:
-    """BlockManager类，用于管理所有block的分配和释放"""
+    """用于管理所有block的分配和释放"""
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size # 每个block的大小
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)] # 总block列表，num_blocks是传入的可用block数量
@@ -108,7 +114,7 @@ class BlockManager:
             seq.block_table.append(block_id) # 把block_id加到seq的block_table里
 
     def deallocate(self, seq: Sequence):
-        """为seq分配block"""
+        """为seq释放block"""
         for block_id in reversed(seq.block_table): # 从后往前遍历seq的block_table
             block = self.blocks[block_id] # 取出block
             block.ref_count -= 1 # 减少引用次数

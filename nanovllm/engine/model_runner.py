@@ -150,10 +150,11 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        return block_tables
+        """为prefix cache准备block表"""
+        max_len = max(len(seq.block_table) for seq in seqs) # 每个seq的block_table长度最大值
+        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs] # 每个seq的block_table长度补齐到最大长度，不足的用-1填充
+        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) # 将block_tables转换为Tensor
+        return block_tables # (seq_num, max_num_blocks)
 
     def prepare_prefill(self, seqs: list[Sequence]):
         """
@@ -195,8 +196,8 @@ class ModelRunner:
                     end = start + seq.last_block_num_tokens
                 # TODO slot_mapping 是为了什么？
                 slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]: # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]: # TODO prefix cache是啥？
+            block_tables = self.prepare_block_tables(seqs) # 为prefix cache准备block表
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True) # 从 CPU 列表构建 Tensor 并异步传输到 GPU
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -236,8 +237,8 @@ class ModelRunner:
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         """计算模型输出下一个token的logits"""
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            # input_ids: [seq_num, _]
-            # positions: [seq_num]
+            # input_ids: [total_tokens]
+            # positions: [total_tokens]
             # 遇到以下三种情况：1）prefill阶段，
             # 2）enforce_eager为true（prefill / decode都可），
             # 3）seq_num大于512，直接走普通调用

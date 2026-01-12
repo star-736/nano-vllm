@@ -13,7 +13,7 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
-    """管理任意一条序列的状态"""
+    """管理任意一条序列的状态，包括token_ids列表，kv cache块表，已缓存的token数等"""
     block_size = 256 # kv cache块大小
     counter = count() # 序列id计数器
 

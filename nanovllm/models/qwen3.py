@@ -17,7 +17,7 @@ class Qwen3Attention(nn.Module):
         self,
         hidden_size: int,
         num_heads: int,
-        num_kv_heads: int,
+        num_kv_heads: int, # GQA，num_kv_heads != num_heads
         max_position: int = 4096 * 32, # 128K
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
@@ -26,7 +26,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size() # tp数
+        tp_size = dist.get_world_size() # TP数
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -69,18 +69,18 @@ class Qwen3Attention(nn.Module):
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states) # qkv: (batch_size, seq_len, 3 * hidden_size)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1) # q, k, v: (batch_size, seq_len, hidden_size)
+        qkv = self.qkv_proj(hidden_states) # qkv: (total_tokens/seq_num, 3 * hidden_size)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1) # q, k, v: (total_tokens/seq_num, hidden_size)
 
         # GQA (Group Query Attention)
-        q = q.view(-1, self.num_heads, self.head_dim) # q: (batch_size * seq_len, num_heads, head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim) # k: (batch_size * seq_len, num_kv_heads, head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim) # v: (batch_size * seq_len, num_kv_heads, head_dim)
+        q = q.view(-1, self.num_heads, self.head_dim) # q: (total_tokens/seq_num, num_heads, head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim) # k: (total_tokens/seq_num, num_kv_heads, head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim) # v: (total_tokens/seq_num, num_kv_heads, head_dim)
         if not self.qkv_bias: # 无qk_bias，做qk_norm
             q = self.q_norm(q)
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k) # 调用的是RotaryEmbedding.forward函数
-        o = self.attn(q, k, v) # attn: (batch_size * seq_len, num_heads, head_dim)
+        o = self.attn(q, k, v) # attn: (total_tokens/seq_num, num_heads, head_dim)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
@@ -197,11 +197,11 @@ class Qwen3ForCausalLM(nn.Module):
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """
         prefill:
-            input_ids: _
+            input_ids: [total_tokens]
+            positions: [total_tokens]
         decode:
             input_ids: [seq_num] the last token id of each seq
-        
-        positions: [seq_num] the position of the last token of each seq
+            positions: [seq_num] the position of the last token of each seq
         """
         return self.model(input_ids, positions) # 计算Qwen3Model的hidden_states
 
