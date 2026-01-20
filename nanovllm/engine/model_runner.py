@@ -14,9 +14,18 @@ from nanovllm.utils.loader import load_model
 
 
 """
+1 初始化：
+初始化LLMEngine时，会为每张卡初始化一个ModelRunner
+初始化ModelRunner时，会调用warmup_model() | allocate_kv_cache() | capture_cudagraph() if enforce_eager is False
+warmup_model()会使用config设置的最大批次的模拟数据跑一边模型的前向计算
+allocate_kv_cache()会计算出 基于当前显存 能分配的最大kv cache block数量，并分配一块连续显存空间，并为每层分配对应的block
+capture_cudagraph()
+
+2 前向计算：
 llm_engine.generate() -> llm_engine.step() -> scheduler.schedule() -> block_manager.allocate()
 以上操作会为传入的seqs分配对应的block，以及搜索seq可能的缓存前缀，加到seq.num_cached_tokens中
 -> model_runner.run() -> model_runner.prepare_prefill() / prepare_decode()
+-> model_runner.run_model() -> model_runner.sampler()
 """
 
 class ModelRunner:
@@ -114,10 +123,14 @@ class ModelRunner:
         return method(*args) # 调用方法
 
     def warmup_model(self):
-        """预热模型：用模拟数据让模型完整跑一遍前向流程，触发 CUDA 懒加载初始化"""
+        """
+        预热模型：用模拟数据让模型完整跑一遍前向流程，触发 CUDA 懒加载初始化
+        模拟数据维度：(num_seqs, max_model_len)
+        """
         torch.cuda.empty_cache() # 释放 PyTorch 不再使用、但被 CUDA 运行时缓存占用的《空闲显存》，将其归还给 GPU
         torch.cuda.reset_peak_memory_stats() # 重置显存峰值统计
-        # max_num_batched_tokens：总token上限；max_model_len：单序列最大长度
+        # max_num_batched_tokens：总token上限
+        # max_model_len：单序列最大长度
         # num_seqs：能塞下的最大序列数（不超过配置的max_num_seqs）
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len # 16384, 4096
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs) # min(4, 512)
