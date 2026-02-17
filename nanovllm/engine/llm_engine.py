@@ -58,7 +58,13 @@ class LLMEngine:
         token_ids = self.model_runner.call("run", seqs, is_prefill) # [seq_num] 每个seq生成一个新的token的id列表
         # 将生成的token_id添加到seq的token_ids列表中，并更新seq状态
         self.scheduler.postprocess(seqs, token_ids) # postprocess每次只处理每个seq的一个token
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished] # 获取已完成序列的seq_id和回答的token_ids
+        outputs = []
+        for seq in seqs:
+            if seq.is_finished:
+                proposed = getattr(seq, "num_speculative_proposed_total", 0)
+                accepted = getattr(seq, "num_speculative_accepted_total", 0)
+                # accept_rate = (accepted / proposed) if proposed > 0 else None
+                outputs.append((seq.seq_id, seq.completion_token_ids, proposed, accepted))
          # 计算一次step生成的总token数，正数说明是prefill生成的token，负数说明是decode生成的token，等于abs(len(seqs))说明是decode阶段，每次只生成一个token
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens # 返回完成序列的id和回答的token_ids，以及当前step生成的总token数
@@ -99,15 +105,20 @@ class LLMEngine:
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
             # 如果有完成的seq，就更新完成的seq生成的回答的内容
-            # 如果没有，说明当前step没有完成任何seq，继续下一个step，以下逻辑不会被执行
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            # 如果没有，说明当前step没有完成任何seq，继续下一个step，以下逻辑不会被执行          
+            for item in output:
+                seq_id, token_ids, proposed, accepted = item
+                outputs[seq_id] = {"token_ids": token_ids, "proposed": proposed, "accepted": accepted}
                 if use_tqdm:
                     pbar.update(1)
         
-        # 按seq_id排序，组成一个二维列表，每个元素代表一个已完成seq的回答的token_ids列表
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs] # 字典列表
+        ordered = [outputs[seq_id] for seq_id in sorted(outputs)]
+        outputs = [{
+            "text": self.tokenizer.decode(item["token_ids"], skip_special_tokens=True),
+            "token_ids": item["token_ids"],
+            "proposed": item["proposed"],
+            "accepted": item["accepted"],
+        } for item in ordered]
         if use_tqdm:
             pbar.close()
         return outputs # 返回所有完成的seq的回答文本和token_ids

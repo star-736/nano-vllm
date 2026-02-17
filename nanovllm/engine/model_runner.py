@@ -3,6 +3,7 @@ import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+from transformers import AutoTokenizer, AutoConfig
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
@@ -11,7 +12,10 @@ from nanovllm.models.models import model_dict
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.sampling_params import SamplingParams
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
 
 """
 1 初始化：
@@ -52,10 +56,32 @@ class ModelRunner:
         self.model = model_dict[hf_config.model_type](hf_config) # 初始化模型
         load_model(self.model, config.model) # 根据不同组件的权重加载方法，加载模型权重
         self.sampler = Sampler() # 初始化采样器
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+
+        #------------------------------------------------------------------------------
+
+        self.speculative_model = None
+        self.num_speculative_tokens = 0
+        self.speculative_decoding = config.speculative_model and config.num_speculative_tokens > 0
+        if self.speculative_decoding:
+            self.speculative_model_hf_config = AutoConfig.from_pretrained(config.speculative_model)
+            self.speculative_model = Qwen3ForCausalLM(self.speculative_model_hf_config)
+            load_model(self.speculative_model, config.speculative_model)
+            self.num_speculative_tokens = config.num_speculative_tokens
+
+            self.speculative_model_tokenizer = AutoTokenizer.from_pretrained(config.speculative_model, use_fast=True)
+            assert self.speculative_model_tokenizer.vocab == self.tokenizer.vocab
+        self.vocab_size = self.tokenizer.vocab_size
+
+        #------------------------------------------------------------------------------
+
         self.warmup_model() # 预跑一遍模型
         self.allocate_kv_cache() # 分配kv缓存，对应config.py中num_kvcache_blocks: int = -1
         if not self.enforce_eager: # enforce_eager为true，不会开cuda_graph
             self.capture_cudagraph()
+            if self.speculative_decoding:
+                self.capture_speculative_cudagraph()
+                self.capture_verify_cudagraph()
         torch.set_default_device("cpu") # 默认设备设置回cpu，后续会从CPU 列表构建 Tensor 并异步传输到 GPU
         torch.set_default_dtype(default_dtype) # 默认数据类型设置回torch.float32
 
@@ -79,6 +105,9 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager: # 如果不是eager模式，删除cuda_graph相关的变量
             del self.graphs, self.graph_pool
+            if self.speculative_decoding:
+                del self.speculative_graphs, self.speculative_graph_pool
+                del self.verify_graphs, self.verify_graph_pool
         torch.cuda.synchronize() # 等待所有GPU操作完成
         dist.destroy_process_group() # 销毁进程组，释放资源
 
@@ -146,12 +175,28 @@ class ModelRunner:
         used = total - free # 已使用的内存
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"] # 内存峰值
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"] # 当前内存使用情况
+
+        # Total bytes available for KV cache allocation (respecting utilization)
+        available_bytes = int(total * config.gpu_memory_utilization - used - peak + current)
+
+        target_split = 1.0
+        if self.speculative_decoding:
+            sconf = self.speculative_model_hf_config
+            split_ratio = (hf_config.num_hidden_layers * hf_config.num_key_value_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize) / (sconf.num_hidden_layers * sconf.num_key_value_heads * sconf.head_dim * sconf.torch_dtype.itemsize)
+            target_split = split_ratio / (1 + split_ratio)
+            assert target_split >= 0.5 and target_split < 1.0
+            print('target_split: ', target_split)
+
+        # Split between main and speculative models
+        main_budget = int(available_bytes * target_split)
+        spec_budget = available_bytes - main_budget
+
         num_kv_heads = hf_config.num_key_value_heads // self.world_size # 每个GPU分配到的的kv头数量
         assert hf_config.hidden_size // hf_config.num_attention_heads == 0
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads) # 每个头的维度（这么写的原因是qwen2没有head_dim这个属性）
         # block_bytes：每个kv block占用的字节数 = 单个block存放的token数 * [(k + v) * attn层数 * kv头数 * 每个头的维度] * 数据类型大小
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes # 计算能分配的kv block数量
+        config.num_kvcache_blocks = main_budget // block_bytes # 计算能分配的kv block数量
         assert config.num_kvcache_blocks > 0
         # 分配kv_cache，共num_kvcache_blocks块，《是连续的！！！》
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
@@ -161,6 +206,30 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+        
+        config.num_draft_kvcache_blocks = 0
+        self.draft_kv_cache = None
+        # Speculative model KV cache, if present
+        if self.speculative_decoding and spec_budget > 0:
+            s_num_kv_heads = sconf.num_key_value_heads // self.world_size
+            s_block_bytes = 2 * sconf.num_hidden_layers * self.block_size * s_num_kv_heads * sconf.head_dim * sconf.torch_dtype.itemsize
+            config.num_draft_kvcache_blocks = spec_budget // s_block_bytes
+            assert config.num_draft_kvcache_blocks > 0
+            self.draft_kv_cache = torch.zeros(
+                2,
+                sconf.num_hidden_layers,
+                config.num_draft_kvcache_blocks,
+                self.block_size,
+                s_num_kv_heads,
+                sconf.head_dim,
+                dtype=sconf.torch_dtype,
+            )
+            layer_id = 0
+            for module in self.speculative_model.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    module.k_cache = self.draft_kv_cache[0, layer_id]
+                    module.v_cache = self.draft_kv_cache[1, layer_id]
+                    layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         """为prefix cache准备block表"""
@@ -188,35 +257,55 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
+            if seq.is_draft:
+                num_tokens_to_process = seq.draft_num_tokens_to_process
+                num_processed_tokens = seq.draft_num_processed_tokens
+                block_table = seq.draft_block_table
+            else:
+                num_tokens_to_process = seq.num_tokens_to_process
+                num_processed_tokens = seq.num_processed_tokens
+                block_table = seq.block_table
             seqlen = len(seq) # 当前序列长度
-            input_ids.extend(seq[seq.num_cached_tokens:]) # 去掉当前序列中已经缓存的token后的token_ids
-            positions.extend(list(range(seq.num_cached_tokens, seqlen))) # extend需要计算的token在当前seq里的下标
-            seqlen_q = seqlen - seq.num_cached_tokens # 当前序列中需要计算的部分长度
-            seqlen_k = seqlen
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q) # 加入q的累积长度
+
+            # Handle chunked prefill: only process specified number of tokens
+            if num_tokens_to_process is not None:  # Chunked prefill or Speculative verify or generate draft tokens
+                input_ids.extend(seq[num_processed_tokens: num_processed_tokens + num_tokens_to_process])
+                positions.extend(list(range(num_processed_tokens, num_processed_tokens + num_tokens_to_process)))
+                seqlen_q = num_tokens_to_process
+                seqlen_k = num_processed_tokens + num_tokens_to_process
+                start_pos = num_processed_tokens
+                if block_table:
+                    for pos in range(start_pos, start_pos + num_tokens_to_process):
+                        block_idx = pos // self.block_size
+                        offset_in_block = pos % self.block_size
+                        block_id = block_table[block_idx]
+                        slot_mapping.append(block_id * self.block_size + offset_in_block)
+            else:
+                input_ids.extend(seq[seq.num_cached_tokens:])
+                positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+                seqlen_q = seqlen - seq.num_cached_tokens
+                seqlen_k = seqlen
+                if seq.block_table:
+                    for i in range(seq.num_cached_blocks, seq.num_blocks):
+                        start = seq.block_table[i] * self.block_size
+                        if i != seq.num_blocks - 1:
+                            end = start + self.block_size
+                        else:
+                            end = start + seq.last_block_num_tokens
+                        slot_mapping.extend(list(range(start, end)))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q) # cumulative sequence lengths
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k) # 加入k的累积长度
             max_seqlen_q = max(seqlen_q, max_seqlen_q) # seqs里需要新算的部分的最大长度
             max_seqlen_k = max(seqlen_k, max_seqlen_k) # seqs里最大长度
-            if not seq.block_table: # warmup不需要slot_mapping 构建
-                continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks): # (已使用的block数, 需要的总block数)
-                # 为还没写入 kv cache  的 block 生成逐 token 的物理位置映射
-                start = seq.block_table[i] * self.block_size # 起始索引
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    # 最后一个block可能未填满，用 seq.last_block_num_tokens 精确到实际 token 数
-                    end = start + seq.last_block_num_tokens
-                # TODO slot_mapping 是为了什么？
-                slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]: # TODO prefix cache是啥？
+        
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs) # 为prefix cache准备block表
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True) # 从 CPU 列表构建 Tensor 并异步传输到 GPU
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables) # 设置全局变量，供flash_attn使用
+        set_context(False, self.num_speculative_tokens, True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables) # 设置全局变量，供flash_attn使用
         return input_ids, positions # 返回input_ids和positions，做前向运算，输出下一token
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -226,16 +315,48 @@ class ModelRunner:
         slot_mapping = []
         context_lens = [] # 每个seq长度的列表
         for seq in seqs:
+            if seq.is_draft:
+                block_table = seq.draft_block_table
+            else:
+                block_table = seq.block_table 
             input_ids.append(seq.last_token) # 每个seq的最后一个token_id
             positions.append(len(seq) - 1) # 每个seq的最后一个token的位置索引
             context_lens.append(len(seq)) # 每个seq的长度
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping.append(block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, self.num_speculative_tokens, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_ids, positions
+
+    def prepare_verify_decode(self, seqs: list[Sequence]):
+        # Build (B*(K+1)) tokens for decode verify: last normal token + K draft tokens per seq
+        input_ids: list[int] = []
+        positions: list[int] = []
+        slot_mapping: list[int] = []
+        context_lens: list[int] = []
+        K = self.num_speculative_tokens
+        for seq in seqs:
+            block_table = seq.block_table
+            start_idx = max(0, len(seq) - K - 1)
+            end_idx = len(seq) - 1
+            input_ids.extend(seq[start_idx: end_idx + 1])
+            positions.extend(list(range(start_idx, end_idx + 1)))
+            for pos in range(start_idx, end_idx + 1):
+                block_idx = pos // self.block_size
+                offset_in_block = pos % self.block_size
+                block_id = block_table[block_idx]
+                slot_mapping.append(block_id * self.block_size + offset_in_block)
+            context_lens.append(len(seq))
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        set_context(True, self.num_speculative_tokens, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -263,17 +384,54 @@ class ModelRunner:
             #   只传入每个seq的最后一个token_id和位置索引，kv_cache由context.get_context()提供
             bs = input_ids.size(0) # bs = seq_num
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)] # 对当前seq_num向上取整
-            graph_vars = self.graph_vars
+            if context.is_speculative:
+                K1 = self.num_speculative_tokens + 1
+                assert bs % K1 == 0, "Speculative verify expects (batch_size * (K+1)) tokens"
+                B = bs // K1
+                graph = self.verify_graphs[next(x for x in self.graph_bs if x >= B)]
+                graph_vars = self.verify_graph_vars
+                for k, v in graph_vars.items():
+                    if k != "outputs":
+                        v.zero_()
+                graph_vars["input_ids"][:bs] = input_ids
+                graph_vars["positions"][:bs] = positions
+                graph_vars["slot_mapping"][:bs] = context.slot_mapping
+                graph_vars["context_lens"][:B] = context.context_lens
+                graph_vars["block_tables"][:B, :context.block_tables.size(1)] = context.block_tables
+            else:
+                graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+                graph_vars = self.graph_vars
+                for k, v in graph_vars.items():
+                    if k != "outputs":
+                        v.zero_()
+                graph_vars["input_ids"][:bs] = input_ids
+                graph_vars["positions"][:bs] = positions
+                graph_vars["slot_mapping"][:bs] = context.slot_mapping
+                graph_vars["context_lens"][:bs] = context.context_lens
+                graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+
+            graph.replay()
+            return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+    @torch.inference_mode()
+    def run_speculative_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            return self.speculative_model.compute_logits(self.speculative_model(input_ids, positions))
+        else:
+            bs = input_ids.size(0)
+            context = get_context()
+            graph = self.speculative_graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph_vars = self.speculative_graph_vars
+            for k, v in graph_vars.items():
+                if k != "outputs":
+                    v.zero_()
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return self.speculative_model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         """
@@ -283,12 +441,122 @@ class ModelRunner:
         计算logits -> 采样token_id -> 重置kv状态 -> 返回seqs的新生成token_id列表
         """
         # 根据is_prefill标识符为prefill / decode 准备输入数据，返回
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None # 采样温度
+        if not is_prefill and self.speculative_decoding and self.rank == 0:
+            return self.run_speculative_decode(seqs, temperatures)  # 模型前向计算，返回logits
+
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         logits = self.run_model(input_ids, positions, is_prefill) # 模型前向计算，返回logits
+        self.vocab_size = logits.size(-1)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None # 采样token_id，只会用主进程来做，子进程回到loop()下一轮
         reset_context() # 重置全局变量
         return token_ids # 返回生成的token_ids列表
+
+    def run_speculative_decode(self, seqs: list[Sequence], temperatures: torch.Tensor) -> list[int]:
+        device = self.model.lm_head.weight.device
+        dtype = self.model.lm_head.weight.dtype
+
+        draft_tokens, draft_probs = self.generate_draft_tokens(seqs, temperatures, device, dtype)
+        final_token_ids = self.verify_draft_tokens(seqs, draft_tokens, draft_probs, temperatures)
+
+        reset_context()
+        return final_token_ids
+
+    @torch.inference_mode()
+    def generate_draft_tokens(
+        self,
+        seqs: list[Sequence],
+        temps: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype
+    ):
+        for seq in seqs:
+            seq.is_speculative = False
+            seq.is_draft = True
+            seq.draft_num_tokens_to_process = seq.num_tokens - seq.draft_num_processed_tokens
+
+        draft_tokens = torch.empty((len(seqs), self.num_speculative_tokens), dtype=torch.int64, device=device)
+        draft_probs = torch.empty((len(seqs), self.num_speculative_tokens, self.vocab_size), dtype=dtype, device=device)
+
+        is_prefill = any(seq.draft_num_tokens_to_process > 1 for seq in seqs)
+        for t in range(self.num_speculative_tokens):
+            if t == 0 and is_prefill:
+                input_ids, positions = self.prepare_prefill(seqs)
+                last_logits = self.run_speculative_model(input_ids, positions, True)
+            else:
+                input_ids, positions = self.prepare_decode(seqs)
+                last_logits = self.run_speculative_model(input_ids, positions, False)
+
+            next_tokens, probs = self.sampler(last_logits, temps, return_probs=True)
+
+            draft_tokens[:, t] = next_tokens  # (B,)
+            draft_probs[:, t] = probs  # (B, V)
+
+            for i, seq in enumerate(seqs):
+                token = int(next_tokens[i].item())
+                seq.append_token(token)
+                seq.draft_num_processed_tokens += seq.draft_num_tokens_to_process
+                seq.draft_num_tokens_to_process = 1
+
+        return draft_tokens, draft_probs
+
+    @torch.inference_mode()
+    def verify_draft_tokens(
+        self,
+        seqs: list[Sequence],
+        draft_tokens: torch.Tensor,
+        draft_probs: torch.Tensor,
+        temps: torch.Tensor
+    ) -> list[int]:
+        for seq in seqs:
+            seq.is_speculative = True
+            seq.is_draft = False
+            seq.num_tokens_to_process = self.num_speculative_tokens + 1
+
+        input_ids, positions = self.prepare_verify_decode(seqs)
+        logits = self.run_model(input_ids, positions, False)
+        temps_reshaped = temps.repeat_interleave(self.num_speculative_tokens + 1)
+        probs = self.sampler.compute_temperature_scaled_probs(logits, temps_reshaped)
+        probs = probs.reshape(len(seqs), -1, probs.size(-1))  # (B, K + 1, V)
+        target_probs = probs[:, :self.num_speculative_tokens, :]  # (B, K, V)
+
+        # verify draft tokens
+        indices = draft_tokens.unsqueeze(-1)  # (B, K, 1)
+        draft_token_probs_from_draft = torch.gather(draft_probs, 2, indices).squeeze(-1)  # (B, K)
+        draft_token_probs_from_target = torch.gather(target_probs, 2, indices).squeeze(-1)
+        accept_ratio = torch.exp(torch.log(draft_token_probs_from_target) - torch.log(draft_token_probs_from_draft))
+        accept_probs = torch.min(torch.ones_like(accept_ratio), accept_ratio)
+
+        accepted = (torch.rand_like(accept_probs) < accept_probs)  # (B, K)
+        valid_tokens_mask = torch.cumprod(accepted, dim=1).bool()  # (B, K)
+        num_accepted = valid_tokens_mask.sum(dim=1)  # (B,)
+
+        if (num_accepted < self.num_speculative_tokens).any():
+            rejection_positions = torch.clamp(num_accepted, max=self.num_speculative_tokens - 1)  # (B,)
+
+            batch_indices = torch.arange(len(seqs), device=rejection_positions.device)  # (B,)
+            target_dist_at_rejection = target_probs[batch_indices, rejection_positions]  # (B, V)
+            draft_dist_at_rejection = draft_probs[batch_indices, rejection_positions]  # (B, V)
+
+            adjusted_probs = torch.clamp(target_dist_at_rejection - draft_dist_at_rejection, min=0)  # (B, V)
+            norm_sum = adjusted_probs.sum(dim=-1, keepdim=True)
+            adjusted_probs = adjusted_probs / torch.clamp(norm_sum, min=1e-8)
+
+            all_accepted_mask = (num_accepted == self.num_speculative_tokens)  # (B,)
+            last_probs = probs[:, -1, :]  # (B, V)
+            final_next_probs = torch.where(all_accepted_mask.unsqueeze(-1), last_probs, adjusted_probs)
+        else:
+            final_next_probs = probs[:, -1, :]
+
+        final_token_ids = self.sampler(final_next_probs, temps)
+
+        for i, seq in enumerate(seqs):
+            accepted_count = num_accepted[i].item()
+            seq.num_speculative_proposed_total += self.num_speculative_tokens
+            seq.num_speculative_accepted_total += accepted_count
+            seq.pending_accepted_tokens = draft_tokens[i, :accepted_count].tolist()
+
+        return final_token_ids.tolist()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -312,6 +580,8 @@ class ModelRunner:
             graph = torch.cuda.CUDAGraph()
             set_context(
                 False, # False表示decode阶段
+                self.speculative_tokens,
+                False,
                 slot_mapping=slot_mapping[:bs], 
                 context_lens=context_lens[:bs], 
                 block_tables=block_tables[:bs])
@@ -325,6 +595,86 @@ class ModelRunner:
             reset_context()
 
         self.graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            outputs=outputs,
+        )
+
+    @torch.inference_mode()
+    def capture_speculative_cudagraph(self):
+        config = self.config
+        hf_config = self.speculative_model_hf_config
+        max_bs = min(self.config.max_num_seqs, 512)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        input_ids = torch.zeros(max_bs, dtype=torch.int64)
+        positions = torch.zeros(max_bs, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.speculative_graphs = {}
+        self.speculative_graph_pool = None
+
+        for bs in reversed(self.graph_bs):
+            graph = torch.cuda.CUDAGraph()
+            set_context(False, self.num_speculative_tokens, False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            outputs[:bs] = self.speculative_model(input_ids[:bs], positions[:bs])    # warmup
+            with torch.cuda.graph(graph, self.speculative_graph_pool):
+                outputs[:bs] = self.speculative_model(input_ids[:bs], positions[:bs])    # capture
+            if self.speculative_graph_pool is None:
+                self.speculative_graph_pool = graph.pool()
+            self.speculative_graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
+
+        self.speculative_graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            outputs=outputs,
+        )
+    
+    @torch.inference_mode()
+    def capture_verify_cudagraph(self):
+        # Capture graphs for target model in speculative verify decode path (K+1 tokens per seq)
+        config = self.config
+        hf_config = config.hf_config
+        max_B = min(self.config.max_num_seqs, 512)
+        K1 = self.num_speculative_tokens + 1
+        max_tokens = max_B * K1
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        input_ids = torch.zeros(max_tokens, dtype=torch.int64)
+        positions = torch.zeros(max_tokens, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_tokens, dtype=torch.int32)
+        context_lens = torch.zeros(max_B, dtype=torch.int32)
+        block_tables = torch.zeros(max_B, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_tokens, hf_config.hidden_size)
+        self.verify_graphs = {}
+        self.verify_graph_pool = None
+
+        for B in reversed(self.graph_bs):
+            if B > max_B:
+                continue
+            graph = torch.cuda.CUDAGraph()
+            n = B * K1
+            set_context(True, self.num_speculative_tokens, False,
+                        slot_mapping=slot_mapping[:n], context_lens=context_lens[:B], block_tables=block_tables[:B])
+            outputs[:n] = self.model(input_ids[:n], positions[:n])  # warmup
+            with torch.cuda.graph(graph, self.verify_graph_pool):
+                outputs[:n] = self.model(input_ids[:n], positions[:n])  # capture
+            if self.verify_graph_pool is None:
+                self.verify_graph_pool = graph.pool()
+            self.verify_graphs[B] = graph
+            torch.cuda.synchronize()
+            reset_context()
+
+        self.verify_graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,

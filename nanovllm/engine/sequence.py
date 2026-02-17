@@ -25,10 +25,16 @@ class Sequence:
         self.num_tokens = len(self.token_ids) # 序列长度
         self.num_prompt_tokens = len(token_ids) # prompt的token数
         self.num_cached_tokens = 0 # 缓存的token数
+        self.num_processed_tokens = 0 # 已处理的token数
+        self.num_tokens_to_process = None # 需要处理的token数
         self.block_table = [] # block表，用于记录kv cache块的id
         self.temperature = sampling_params.temperature # 温度，seq之间可不同
         self.max_tokens = sampling_params.max_tokens # 单条样本的最大token数
         self.ignore_eos = sampling_params.ignore_eos # 是否忽略EOS
+
+        # Speculative decoding metrics, sequence level
+        self.num_speculative_proposed_total = 0 # 总的 speculative proposed token 数
+        self.num_speculative_accepted_total = 0 # 总的 speculative accepted token 数
 
     def __len__(self):
         return self.num_tokens # 返回序列长度
@@ -74,12 +80,21 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def pop_last_n_tokens(self, n: int):
+        if n <= 0:
+            return
+        if n >= self.num_tokens - 1:
+            n = self.num_tokens - 1
+        del self.token_ids[-n:]
+        self.num_tokens -= n
+        self.last_token = self.token_ids[-1]
+
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.num_processed_tokens, self.num_tokens_to_process,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.num_processed_tokens, self.num_tokens_to_process = state[:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:

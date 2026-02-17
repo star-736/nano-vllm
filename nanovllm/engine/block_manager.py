@@ -31,12 +31,25 @@ class Block:
 
 class BlockManager:
     """用于管理所有block的分配和释放"""
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, num_draft_blocks: int = 0, speculative_decoding: bool = False, num_speculative_tokens: int = 0):
+        assert num_blocks > 0
         self.block_size = block_size # 每个block的大小
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)] # 总block列表，num_blocks是传入的可用block数量
         self.hash_to_block_id: dict[int, int] = dict() # hash值到block_id的映射
         self.free_block_ids: deque[int] = deque(range(num_blocks)) # 可用的block_id集合，是个双向队列
         self.used_block_ids: set[int] = set() # 已使用的block_id集合，不能重复
+
+        self.speculative_decoding = speculative_decoding
+        self.num_speculative_tokens = num_speculative_tokens
+
+        self.draft_blocks = None
+        self.hash_to_draft_block_id: dict[int, int] = dict()
+        self.free_draft_block_ids = None
+        self.used_draft_block_ids = None
+        if self.speculative_decoding and num_draft_blocks > 0:
+            self.draft_blocks: list[Block] = [Block(i) for i in range(num_draft_blocks)]
+            self.free_draft_block_ids: deque[int] = deque(range(num_draft_blocks))
+            self.used_draft_block_ids: set[int] = set()
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -72,6 +85,11 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    def _deallocate_draft_block(self, block_id: int) -> Block:
+        assert self.draft_blocks[block_id].ref_count == 0
+        self.used_draft_block_ids.remove(block_id)
+        self.free_draft_block_ids.append(block_id)
+
     def can_allocate(self, seq: Sequence) -> bool:
         """
         判断空闲block数量是否能覆盖传入序列需要的block数
@@ -85,7 +103,7 @@ class BlockManager:
         在prefill阶段执行，只会执行一次
         """
         assert not seq.block_table # 确保seq的block_table为空，即第一次分配blocks
-        hh = -1 # 初始化hash值
+        h = -1 # 初始化hash值
         cache_miss = False # 初始化缓存miss标志
         for i in range(seq.num_blocks): # 遍历seq所需的block数
             token_ids = seq.block(i) # 获取seq当前block的token_ids列表
@@ -112,6 +130,31 @@ class BlockManager:
                 block.update(h, token_ids) # 赋值hash值
                 self.hash_to_block_id[h] = block_id # 在字典里把hash值和block_id对应起来
             seq.block_table.append(block_id) # 把block_id加到seq的block_table里
+        
+        # Allocate draft blocks
+        if self.speculative_decoding:
+            assert not seq.draft_block_table
+            h = -1
+            cache_miss = False
+            for i in range(seq.num_blocks):
+                token_ids = seq.block(i)
+                h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+                block_id = self.hash_to_draft_block_id.get(h, -1)
+                if block_id == -1 or self.draft_blocks[block_id].token_ids != token_ids:
+                    cache_miss = True
+                if cache_miss:
+                    block_id = self.free_draft_block_ids[0]
+                    block = self._allocate_draft_block(block_id)
+                else:
+                    if block_id in self.used_draft_block_ids:
+                        block = self.draft_blocks[block_id]
+                        block.ref_count += 1
+                    else:
+                        block = self._allocate_draft_block(block_id)
+                if h != -1:
+                    block.update(h, token_ids)
+                    self.hash_to_draft_block_id[h] = block_id
+                seq.draft_block_table.append(block_id)
 
     def deallocate(self, seq: Sequence):
         """为seq释放block"""
@@ -123,13 +166,30 @@ class BlockManager:
         seq.num_cached_tokens = 0 # 清零seq的缓存token总数
         seq.block_table.clear() # 清空seq的block_table
 
+        # Deallocate draft blocks
+        if self.speculative_decoding:
+            for block_id in reversed(seq.draft_block_table):
+                block = self.draft_blocks[block_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._deallocate_draft_block(block_id)
+            seq.draft_block_table.clear()
+
     def can_append(self, seq: Sequence) -> bool:
         """
         剩余的block块的个数 >= （最后一个block的token数 == 1）
         只有取余后发现多出一个token的时候才需要再分配一个整块
         在decode执行之前会去判断
         """
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        # return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        if self.speculative_decoding:
+            target_len = len(seq) + self.num_speculative_tokens
+            needed_blocks = (target_len + self.block_size - 1) // self.block_size
+            required_blocks = max(0, needed_blocks - len(seq.block_table))
+            return len(self.free_block_ids) >= required_blocks and len(self.free_draft_block_ids) >= required_blocks
+        else:
+            required_blocks = 1 if (len(seq) % self.block_size == 1) else 0
+            return len(self.free_block_ids) >= required_blocks
 
     def may_append(self, seq: Sequence):
         """
@@ -137,19 +197,46 @@ class BlockManager:
         may_append是在每次decode之前做的准备
         """
         block_table = seq.block_table # 拿到当前seq的block_table
+        draft_block_table = seq.draft_block_table
         last_block = self.blocks[block_table[-1]] # 拿到最后一个block
-        if len(seq) % self.block_size == 1: # 如果取余发现多出一个token
-            assert last_block.hash != -1 # 确保最后一个block是满的，有hash值
-            block_id = self.free_block_ids[0] # 从空闲队列里取一个block_id
-            self._allocate_block(block_id) # 分配新的block
-            block_table.append(block_id) # 把新的block_id加到block_table里
-        elif len(seq) % self.block_size == 0: # 如果最后一个满了，需要更新hash值
-            assert last_block.hash == -1 # 确保最后一个block是没满，没有hash值
-            token_ids = seq.block(seq.num_blocks-1) # 获取最后一个block的token_ids列表
-            # 获取前一个block的hash值，如果没有前一个block，返回-1
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix) # 计算新的hash值
-            last_block.update(h, token_ids) # 更新最后一个block的hash值
-            self.hash_to_block_id[h] = last_block.block_id # 在字典里把新的hash值和block_id对应起来
+
+        if self.speculative_decoding:
+            need_new_block = (len(seq) + self.num_speculative_tokens > len(block_table) * self.block_size)
+            if need_new_block:
+                if last_block.hash == -1:
+                    token_ids = seq.block(seq.num_blocks - 1)
+                    if len(token_ids) == self.block_size:
+                        prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                        h = self.compute_hash(token_ids, prefix)
+                        last_block.update(h, token_ids)
+                        self.hash_to_block_id[h] = last_block.block_id
+                    else:
+                        assert last_block.hash == -1
+
+                main_block_id = self.free_block_ids[0]
+                self._allocate_block(main_block_id)
+                block_table.append(main_block_id)
+                last_block = self.blocks[block_table[-1]]
+
+                # draft block
+                draft_block_id = self.free_draft_block_ids[0]
+                self._allocate_draft_block(draft_block_id)
+                draft_block_table.append(draft_block_id)
+            else:
+                assert last_block.hash == -1
         else:
-            assert last_block.hash == -1 # 最后一个block没满，没有hash值，确认一下
+            if len(seq) % self.block_size == 1:  # a new block needs to be allocated
+                assert last_block.hash != -1 # 确保最后一个block是满的，有hash值
+                block_id = self.free_block_ids[0] # 从空闲队列里取一个block_id
+                self._allocate_block(block_id) # 分配新的block
+                block_table.append(block_id) # 把新的block_id加到block_table里
+            elif len(seq) % self.block_size == 0:  # the last block gets finalized with a hash
+                assert last_block.hash == -1 # 确保最后一个block是没满，没有hash值
+                token_ids = seq.block(seq.num_blocks - 1) # 获取最后一个block的token_ids列表
+                # 获取前一个block的hash值，如果没有前一个block，返回-1
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix) # 计算新的hash值
+                last_block.update(h, token_ids) # 更新最后一个block的hash值
+                self.hash_to_block_id[h] = last_block.block_id # 在字典里把新的hash值和block_id对应起来
+            else:
+                assert last_block.hash == -1 # 最后一个block没满，没有hash值，确认一下

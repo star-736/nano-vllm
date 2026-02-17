@@ -6,7 +6,7 @@ from transformers import AutoConfig
 @dataclass
 class Config:
     model: str # 模型路径
-    max_num_batched_tokens: int = 16384 # 总token上限
+    max_num_batched_tokens: int = 16384 # 总token上限 4096 * 4
     max_num_seqs: int = 512 # 最大batch数
     max_model_len: int = 4096 # 最大序列长度
     gpu_memory_utilization: float = 0.9 # 总显存的 90% 减去当前/峰值占用后的预算
@@ -16,6 +16,9 @@ class Config:
     eos: int = -1 # 结束符
     kv_cache_block_size: int = 256 # KV Cache块大小
     num_kvcache_blocks: int = -1 # 自动计算需要的KV Cache块数
+    enable_chunked_prefill: bool = False
+    speculative_model: str | None = None
+    num_speculative_tokens: int = 0
 
     def __post_init__(self): # 实例化后自动调用
         assert os.path.isdir(self.model)
