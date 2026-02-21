@@ -16,16 +16,20 @@ class Context:
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None 
 
+    # new feature: speculative decoding
+    is_speculative: bool = False
+    num_speculative_tokens: int = 0
+
 _CONTEXT = Context()
 
 def get_context():
     """返回全局变量"""
     return _CONTEXT
 
-def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None):
+def set_context(is_speculative, num_speculative_tokens, is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None):
     """更新全局变量"""
     global _CONTEXT
-    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables)
+    _CONTEXT = Context(is_speculative, num_speculative_tokens, is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables)
 
 def reset_context():
     """重置为默认值的全局变量"""

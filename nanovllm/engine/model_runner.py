@@ -49,7 +49,7 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank) # 设置当前进程的GPU设备
         default_dtype = torch.get_default_dtype() # 默认数据类型：torch.float32
-        torch.set_default_dtype(hf_config.torch_dtype) # 设置默认数据类型为模型的torch_dtype：bfloat16，用于加载模型
+        torch.set_default_dtype(hf_config.dtype) # 设置默认数据类型为模型的torch_dtype：bfloat16，用于加载模型
         torch.set_default_device("cuda") # 设置默认设备为cuda
 
         # self.model = Qwen3ForCausalLM(hf_config) # 初始化模型
@@ -182,7 +182,7 @@ class ModelRunner:
         target_split = 1.0
         if self.speculative_decoding:
             sconf = self.speculative_model_hf_config
-            split_ratio = (hf_config.num_hidden_layers * hf_config.num_key_value_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize) / (sconf.num_hidden_layers * sconf.num_key_value_heads * sconf.head_dim * sconf.torch_dtype.itemsize)
+            split_ratio = (hf_config.num_hidden_layers * hf_config.num_key_value_heads * hf_config.head_dim * hf_config.dtype.itemsize) / (sconf.num_hidden_layers * sconf.num_key_value_heads * sconf.head_dim * sconf.dtype.itemsize)
             target_split = split_ratio / (1 + split_ratio)
             assert target_split >= 0.5 and target_split < 1.0
             print('target_split: ', target_split)
@@ -192,10 +192,10 @@ class ModelRunner:
         spec_budget = available_bytes - main_budget
 
         num_kv_heads = hf_config.num_key_value_heads // self.world_size # 每个GPU分配到的的kv头数量
-        assert hf_config.hidden_size // hf_config.num_attention_heads == 0
+        assert hf_config.hidden_size % hf_config.num_attention_heads == 0
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads) # 每个头的维度（这么写的原因是qwen2没有head_dim这个属性）
         # block_bytes：每个kv block占用的字节数 = 单个block存放的token数 * [(k + v) * attn层数 * kv头数 * 每个头的维度] * 数据类型大小
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = main_budget // block_bytes # 计算能分配的kv block数量
         assert config.num_kvcache_blocks > 0
         # 分配kv_cache，共num_kvcache_blocks块，《是连续的！！！》
@@ -234,8 +234,11 @@ class ModelRunner:
     def prepare_block_tables(self, seqs: list[Sequence]):
         """为prefix cache准备block表"""
         max_len = max(len(seq.block_table) for seq in seqs) # 每个seq的block_table长度最大值
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs] # 每个seq的block_table长度补齐到最大长度，不足的用-1填充
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) # 将block_tables转换为Tensor
+        if seqs[0].is_draft:
+            block_tables = [seq.draft_block_table + [-1] * (max_len - len(seq.draft_block_table)) for seq in seqs] # 每个seq的block_table长度补齐到最大长度，不足的用-1填充
+        else:
+            block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)  # 将block_tables转换为Tensor
         return block_tables # (seq_num, max_num_blocks)
 
     def prepare_prefill(self, seqs: list[Sequence]):
@@ -580,7 +583,7 @@ class ModelRunner:
             graph = torch.cuda.CUDAGraph()
             set_context(
                 False, # False表示decode阶段
-                self.speculative_tokens,
+                self.num_speculative_tokens,
                 False,
                 slot_mapping=slot_mapping[:bs], 
                 context_lens=context_lens[:bs], 

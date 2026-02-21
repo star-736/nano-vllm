@@ -16,6 +16,8 @@ class Config:
     eos: int = -1 # 结束符
     kv_cache_block_size: int = 256 # KV Cache块大小
     num_kvcache_blocks: int = -1 # 自动计算需要的KV Cache块数
+    
+    # new features
     enable_chunked_prefill: bool = False
     speculative_model: str | None = None
     num_speculative_tokens: int = 0

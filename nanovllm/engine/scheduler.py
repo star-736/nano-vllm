@@ -18,7 +18,7 @@ class Scheduler:
         self.num_speculative_tokens = config.num_speculative_tokens
         self.block_manager = BlockManager(
             config.num_kvcache_blocks,
-            config.kvcache_block_size,
+            config.kv_cache_block_size,
             num_draft_blocks=config.num_draft_kvcache_blocks,
             speculative_decoding=self.speculative_decoding,
             num_speculative_tokens=self.num_speculative_tokens
