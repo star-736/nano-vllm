@@ -10,13 +10,27 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
 
-    @torch.compile
-    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
-        """
-        logits: [batch_size, vocab_size]
-        temperatures: [batch_size]
-        """
-        logits = logits.float().div_(temperatures.unsqueeze(dim=1)) # 温度缩放
-        probs = torch.softmax(logits, dim=-1) # softmax转换为概率
-        sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1) # 指数分布采样
-        return sample_tokens # 返回采样后的token [batch_size]
+    def compute_temperature_scaled_probs(self, logits: torch.Tensor, temperatures: torch.Tensor):
+        logits = logits.to(torch.float)
+        safe_temperatures = torch.where(temperatures == 0, torch.ones_like(temperatures), temperatures)
+        logits.div_(safe_temperatures.unsqueeze(dim=1))
+        probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+        return probs
+
+    def sample_from_probs(self, probs: torch.Tensor, temperatures: torch.Tensor):
+        probs = probs.to(torch.float)
+        greedy_tokens = probs.argmax(dim=-1)
+        sample_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        return torch.where(temperatures == 0, greedy_tokens, sample_tokens)
+
+    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor, return_probs: bool = False):
+        logits = logits.to(torch.float)
+        greedy_tokens = logits.argmax(dim=-1)
+        safe_temperatures = torch.where(temperatures == 0, torch.ones_like(temperatures), temperatures)
+        logits.div_(safe_temperatures.unsqueeze(dim=1))
+        probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+        sample_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        tokens = torch.where(temperatures == 0, greedy_tokens, sample_tokens)
+        if return_probs:
+            return tokens, probs
+        return tokens

@@ -32,6 +32,14 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens # 单条样本的最大token数
         self.ignore_eos = sampling_params.ignore_eos # 是否忽略EOS
 
+        # Speculative decoding fields
+        self.is_speculative = False
+        self.pending_accepted_tokens = []
+        self.is_draft = False
+        self.draft_block_table = []
+        self.draft_num_processed_tokens = 0
+        self.draft_num_tokens_to_process = 0
+
         # Speculative decoding metrics, sequence level
         self.num_speculative_proposed_total = 0 # 总的 speculative proposed token 数
         self.num_speculative_accepted_total = 0 # 总的 speculative accepted token 数
@@ -90,12 +98,44 @@ class Sequence:
         self.last_token = self.token_ids[-1]
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.num_processed_tokens, self.num_tokens_to_process,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+            self.num_processed_tokens,
+            self.num_tokens_to_process,
+            self.is_speculative,
+            self.pending_accepted_tokens,
+            self.is_draft,
+            self.draft_block_table,
+            self.draft_num_processed_tokens,
+            self.draft_num_tokens_to_process,
+            self.num_speculative_proposed_total,
+            self.num_speculative_accepted_total,
+            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+        )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.num_processed_tokens, self.num_tokens_to_process = state[:-1]
+        (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+            self.num_processed_tokens,
+            self.num_tokens_to_process,
+            self.is_speculative,
+            self.pending_accepted_tokens,
+            self.is_draft,
+            self.draft_block_table,
+            self.draft_num_processed_tokens,
+            self.draft_num_tokens_to_process,
+            self.num_speculative_proposed_total,
+            self.num_speculative_accepted_total,
+        ) = state[:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
+            self.last_token = self.token_ids[-1]
         else:
             self.last_token = state[-1]
+            self.token_ids = []

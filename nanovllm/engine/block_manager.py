@@ -76,6 +76,14 @@ class BlockManager:
         self.used_block_ids.add(block_id) # 加到已用集合
         return self.blocks[block_id] # 返回block
 
+    def _allocate_draft_block(self, block_id: int) -> Block:
+        block = self.draft_blocks[block_id]
+        assert block.ref_count == 0
+        block.reset()
+        self.free_draft_block_ids.remove(block_id)
+        self.used_draft_block_ids.add(block_id)
+        return self.draft_blocks[block_id]
+
     def _deallocate_block(self, block_id: int) -> Block:
         """
         释放一个block，
@@ -95,7 +103,9 @@ class BlockManager:
         判断空闲block数量是否能覆盖传入序列需要的block数
         在scheduler里会有判断
         """
-        return len(self.free_block_ids) >= seq.num_blocks
+        if not self.speculative_decoding:
+            return len(self.free_block_ids) >= seq.num_blocks
+        return len(self.free_block_ids) >= seq.num_blocks and len(self.free_draft_block_ids) >= seq.num_blocks
 
     def allocate(self, seq: Sequence):
         """

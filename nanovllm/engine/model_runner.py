@@ -65,10 +65,10 @@ class ModelRunner:
         self.speculative_decoding = config.speculative_model and config.num_speculative_tokens > 0
         if self.speculative_decoding:
             self.speculative_model_hf_config = AutoConfig.from_pretrained(config.speculative_model)
-            self.speculative_model = Qwen3ForCausalLM(self.speculative_model_hf_config)
+            sconf = self.speculative_model_hf_config
+            self.speculative_model = model_dict[sconf.model_type](sconf)
             load_model(self.speculative_model, config.speculative_model)
             self.num_speculative_tokens = config.num_speculative_tokens
-
             self.speculative_model_tokenizer = AutoTokenizer.from_pretrained(config.speculative_model, use_fast=True)
             assert self.speculative_model_tokenizer.vocab == self.tokenizer.vocab
         self.vocab_size = self.tokenizer.vocab_size
@@ -212,7 +212,7 @@ class ModelRunner:
         # Speculative model KV cache, if present
         if self.speculative_decoding and spec_budget > 0:
             s_num_kv_heads = sconf.num_key_value_heads // self.world_size
-            s_block_bytes = 2 * sconf.num_hidden_layers * self.block_size * s_num_kv_heads * sconf.head_dim * sconf.torch_dtype.itemsize
+            s_block_bytes = 2 * sconf.num_hidden_layers * self.block_size * s_num_kv_heads * sconf.head_dim * sconf.dtype.itemsize
             config.num_draft_kvcache_blocks = spec_budget // s_block_bytes
             assert config.num_draft_kvcache_blocks > 0
             self.draft_kv_cache = torch.zeros(
@@ -222,7 +222,7 @@ class ModelRunner:
                 self.block_size,
                 s_num_kv_heads,
                 sconf.head_dim,
-                dtype=sconf.torch_dtype,
+                dtype=sconf.dtype,
             )
             layer_id = 0
             for module in self.speculative_model.modules():
@@ -551,7 +551,7 @@ class ModelRunner:
         else:
             final_next_probs = probs[:, -1, :]
 
-        final_token_ids = self.sampler(final_next_probs, temps)
+        final_token_ids = self.sampler.sample_from_probs(final_next_probs, temps)
 
         for i, seq in enumerate(seqs):
             accepted_count = num_accepted[i].item()

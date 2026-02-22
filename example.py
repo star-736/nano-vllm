@@ -6,13 +6,14 @@ from transformers import AutoTokenizer
 
 def main(args):
     path = os.path.expanduser(args.model_path)
+    spec_path = os.path.expanduser(args.speculative_model_path)
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(
         path,
         enforce_eager=args.enforce_eager,
         tensor_parallel_size=args.tensor_parallel_size,
         enable_chunked_prefill=True,
-        speculative_model=args.speculative_model_path,
+        speculative_model=spec_path,
         num_speculative_tokens=args.num_speculative_tokens
     )
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens) # 生成的最大token数量
@@ -47,8 +48,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="nano vllm")
     parser.add_argument("--model_path", type=str, default="~/huggingface/Qwen3-0.6B/")
-    parser.add_argument("--speculative-model-path", type=str, default="~/huggingface/MiniCPM4-0.5B/")
-    parser.add_argument("--num-speculative-tokens", type=int, default=5)
+    parser.add_argument("--speculative-model-path", type=str, default="~/huggingface/Qwen3-0.6B/")
+    parser.add_argument("--num-speculative-tokens", type=int, default=3)
     parser.add_argument("--tensor-parallel-size", "--tp", type=int, default=1)
     parser.add_argument("--enforce-eager", type=bool, default=True)
     parser.add_argument("--temperature", type=float, default=0.9)

@@ -7,6 +7,8 @@ import torch
 
 @dataclass
 class Context:
+    is_speculative: bool = False
+    num_speculative_tokens: int = 0
     is_prefill: bool = False # 是否在prefill阶段
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
@@ -15,10 +17,6 @@ class Context:
     slot_mapping: torch.Tensor | None = None # 见model_runner | prepare_prefill / prepare_decode
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None 
-
-    # new feature: speculative decoding
-    is_speculative: bool = False
-    num_speculative_tokens: int = 0
 
 _CONTEXT = Context()
 
