@@ -85,6 +85,12 @@ class Scheduler:
         return scheduled_seqs, False # 返回decode列表和False
 
     def _chunked_prefill_schedule(self) -> tuple[list[Sequence], bool]:
+        '''
+        此项目中的chunked_prefill是为了：
+            避免 OOM 或超出 max_num_batched_tokens：一口气吃不下，只能切
+            不会降低单个请求的延时
+        一个batch要么只有prefill，要么只有decode
+        '''
         token_budget = self.max_num_batched_tokens
 
         # prefill
@@ -94,36 +100,35 @@ class Scheduler:
         while self.waiting and token_budget > 0 and num_seqs < self.max_num_seqs:
             seq = self.waiting.popleft()
 
-            if (not seq.block_table) and (not self.block_manager.can_allocate(seq)):
-                temp_waiting.append(seq)
+            if (not seq.block_table) and (not self.block_manager.can_allocate(seq)): # 当前block数不够了
+                temp_waiting.append(seq) # 将当前序列添加到临时等待队列
                 continue
 
-            if not seq.block_table:
-                self.block_manager.allocate(seq)
+            if not seq.block_table: # 当前序列还没分配block
+                self.block_manager.allocate(seq) # 分配block
 
-            prompt_tokens_left = len(seq) - seq.num_processed_tokens
+            prompt_tokens_left = len(seq) - seq.num_processed_tokens # 当前序列剩余的待处理的token数
             assert prompt_tokens_left > 0
-            if prompt_tokens_left <= token_budget:
-                seq.status = SequenceStatus.RUNNING
+            if prompt_tokens_left <= token_budget: # 如果当前序列剩余的待处理的token数小于等于token_budget
+                seq.status = SequenceStatus.RUNNING # 设置为RUNNING状态
                 scheduled_seqs.append(seq)
                 num_seqs += 1
-                seq.num_tokens_to_process = prompt_tokens_left
-                token_budget -= prompt_tokens_left
+                seq.num_tokens_to_process = prompt_tokens_left # 当前序列需要处理的token数设置为剩余的待处理的token数
+                token_budget -= prompt_tokens_left # token_budget减去当前序列剩余的待处理的token数
                 self.running.append(seq)
-            else:
+            else: # 当前序列待处理的token数大于token_budget，说明无法一次性把剩余的处理掉，则需要进行chunk
                 # Chunk the prompt
-                chunk_size = token_budget
+                chunk_size = token_budget # 当前序列需要处理的token数设置为token_budget
                 seq.status = SequenceStatus.RUNNING
                 scheduled_seqs.append(seq)
                 num_seqs += 1
-                seq.num_tokens_to_process = chunk_size
+                seq.num_tokens_to_process = chunk_size # 当前序列需要处理的token数设置为token_budget
                 token_budget = 0
-                # temp_waiting.append(seq)
 
         if temp_waiting:
-            self.waiting.extendleft(reversed(temp_waiting))
+            self.waiting.extendleft(reversed(temp_waiting)) # 将临时等待队列中的序列添加到等待队列
 
-        if scheduled_seqs:
+        if scheduled_seqs: # 如果有已调度的序列，则直接返回
             return scheduled_seqs, True
 
         # decode
