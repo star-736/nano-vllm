@@ -5,7 +5,7 @@ import torch
 全局变量，和flash_attn的计算相关
 """
 
-@dataclass
+@dataclass(slots=True)
 class Context:
     is_prefill: bool = False # 是否在prefill阶段
     cu_seqlens_q: torch.Tensor | None = None

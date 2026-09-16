@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import time
 import uuid
 import threading
@@ -64,10 +65,17 @@ def create_app(llm: LLM) -> FastAPI:
     async def chat_completions(payload: Dict[str, Any] = Body(...)):
         messages: List[Dict[str, str]] = payload.get("messages", [])
         model: Optional[str] = payload.get("model")
-        temperature: float = float(payload.get("temperature", 1.0))
-        max_tokens: int = int(payload.get("max_tokens", 64))
+        try:
+            temperature: float = float(payload.get("temperature", 1.0))
+            max_tokens: int = int(payload.get("max_tokens", 64))
+            n: int = int(payload.get("n", 1))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid sampling parameters") from exc
+        if not math.isfinite(temperature) or temperature <= 1e-10:
+            raise HTTPException(status_code=400, detail="temperature must be positive; greedy sampling is not supported")
+        if max_tokens < 1 or n < 1:
+            raise HTTPException(status_code=400, detail="max_tokens and n must be positive")
         stream: bool = bool(payload.get("stream", False))
-        n: int = int(payload.get("n", 1))
 
         if not messages:
             raise HTTPException(status_code=400, detail="'messages' is required")

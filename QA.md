@@ -1,3 +1,5 @@
+> 版本说明（2026-09-17）：以下学习资料保留自个人 main；旧版整段 prefill、缓存与调度说明不完全适用于当前上游 chunked prefill。请先阅读 [同步与迁移说明](docs/upstream-sync-20260917.md)。
+
 
 # Nano-vLLM 问答（基于仓库实现）
 

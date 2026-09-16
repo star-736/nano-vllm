@@ -23,7 +23,7 @@ class Qwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
         rope_theta: float = 10000,
-        rope_scaling: tuple | None = None,
+        rope_scaling: dict | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size() # TP数
@@ -52,6 +52,7 @@ class Qwen3Attention(nn.Module):
             bias=False,
         )
         if isinstance(rope_scaling, dict):
+            rope_theta = rope_scaling.get("rope_theta", rope_theta)
             rope_scaling = None
 
         self.rotary_emb = get_rope(

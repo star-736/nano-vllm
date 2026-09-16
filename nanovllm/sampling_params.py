@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 
-@dataclass
+@dataclass(slots=True)
 class SamplingParams:
     temperature: float = 1.0 # 温度
     max_tokens: int = 64 # 单条样本最大token数

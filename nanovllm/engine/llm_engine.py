@@ -11,9 +11,6 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
-"""
-LLMEngine是nano-vllm的入口类，负责初始化model、tokenizer、scheduler和model_runner等，并提供生成文本的接口。
-"""
 
 class LLMEngine:
 
@@ -21,20 +18,21 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
-        self.ps = [] # 进程列表
-        self.events = [] # config.tensor_parallel_size - 1 个event，传入主进程
+        Sequence.block_size = config.kvcache_block_size
+        self.ps = []
+        self.events = []
         ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size): # 单卡不会进行以下循环操作，也就是不会开子进程
+        for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event)) # 创建子进程，每个机器上都跑一个ModelRunner
+            process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events) # 主进程model_runner对象，传入config，rank为0，会在其中加载模型权重
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True) # 创建tokenizer
-        config.eos = self.tokenizer.eos_token_id # 设置结束符
-        self.scheduler = Scheduler(config) # 初始化调度器
-        atexit.register(self.exit) # 注册exit函数
+        self.model_runner = ModelRunner(config, 0, self.events)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        config.eos = self.tokenizer.eos_token_id
+        self.scheduler = Scheduler(config)
+        atexit.register(self.exit)
 
     def exit(self):
         self.model_runner.call("exit")
@@ -42,29 +40,22 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    # 添加请求到waiting的双端队列里
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str): # 判断是否为str类型
-            prompt = self.tokenizer.encode(prompt) # 将prompt转换为token_ids | str -> list[int]
-        seq = Sequence(prompt, sampling_params) # 创建序列对象
-        self.scheduler.add(seq) # 调用scheduler的add方法，将序列对象添加到等待队列中
+        if isinstance(prompt, str):
+            prompt = self.tokenizer.encode(prompt)
+        seq = Sequence(prompt, sampling_params)
+        self.scheduler.add(seq)
 
     def step(self):
-        """nano-vllm是prefill优先的思路，优先为所有序列做预填充，直到全部填充完，才去为序列做解码"""
-        # 对序列进行调度，如果还有没做prefill的序列，则优先返回prefill的序列列表，同时is_prefill=True
-        # 如果都做完prefill了，就返回decode的序列列表，同时is_prefill=False
         seqs, is_prefill = self.scheduler.schedule()
-        # 将需要处理的seqs送到model_runner的run函数中处理，每个seq返回预测的一个token_id，组成token_ids
-        token_ids = self.model_runner.call("run", seqs, is_prefill) # [seq_num] 每个seq生成一个新的token的id列表
-        # 将生成的token_id添加到seq的token_ids列表中，并更新seq状态
-        self.scheduler.postprocess(seqs, token_ids) # postprocess每次只处理每个seq的一个token
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished] # 获取已完成序列的seq_id和回答的token_ids
-         # 计算一次step生成的总token数，正数说明是prefill生成的token，负数说明是decode生成的token，等于abs(len(seqs))说明是decode阶段，每次只生成一个token
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        return outputs, num_tokens # 返回完成序列的id和回答的token_ids，以及当前step生成的总token数
+        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        return outputs, num_tokens
 
     def is_finished(self):
-        return self.scheduler.is_finished() # 是否所有序列都完成
+        return self.scheduler.is_finished()
 
     def generate(
         self,
@@ -72,42 +63,28 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
-        # 传入prompt列表 
-        if use_tqdm:
-            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
-            # 复制多次sampling_params对象
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp) # prompt和sampling_params一一绑定后送到add_request函数中，添加到等待队列中
-        outputs = {} # 用于存储完成序列的id和回答的token_ids
+            self.add_request(prompt, sp)
+        outputs = {}
         prefill_throughput = decode_throughput = 0.
-        while not self.is_finished(): # 判断当前任务是否都完成（waiting和running队列都为空，则完成）
-            t = perf_counter() # 记录当前时间
-            output, num_tokens = self.step() # 执行任务，包括waiting和running里的所有序列
-            # 返回完成序列的id和回答的token_ids（该列表可能为空），以及当前step生成的总token数
-            # （num_tokens是正数说明是prefill阶段，负数说明是decode阶段）
-
-            # 数据统计部分：prefill和decode的吞吐量
-            if use_tqdm:
-                if num_tokens > 0: # 正数，说明是prefill阶段
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else: # 负数，说明是decode阶段
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)}tok/s",
-                    "Decode": f"{int(decode_throughput)}tok/s",
-                })
-            # 如果有完成的seq，就更新完成的seq生成的回答的内容
-            # 如果没有，说明当前step没有完成任何seq，继续下一个step，以下逻辑不会被执行
+        while not self.is_finished():
+            t = perf_counter()
+            output, num_tokens = self.step()
+            if num_tokens > 0:
+                prefill_throughput = num_tokens / (perf_counter() - t)
+            else:
+                decode_throughput = -num_tokens / (perf_counter() - t)
+            pbar.set_postfix({
+                "Prefill": f"{int(prefill_throughput)}tok/s",
+                "Decode": f"{int(decode_throughput)}tok/s",
+            })
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
-                if use_tqdm:
-                    pbar.update(1)
-        
-        # 按seq_id排序，组成一个二维列表，每个元素代表一个已完成seq的回答的token_ids列表
+                pbar.update(1)
+        pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs] # 字典列表
-        if use_tqdm:
-            pbar.close()
-        return outputs # 返回所有完成的seq的回答文本和token_ids
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        return outputs
